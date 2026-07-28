@@ -59,7 +59,7 @@ cancel_turn
 set_head
 ```
 
-Every event carries a session ID, a monotonic sequence number, and a timestamp, so trace export is an assembly step rather than a retrofit.
+Every event carries a monotonic sequence number, a timestamp, and its session ID (`sessions_listed`, which spans sessions, carries none), so trace export is an assembly step rather than a retrofit.
 
 ```text
 session_created | session_loaded | sessions_listed
