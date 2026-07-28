@@ -150,6 +150,7 @@ async fn golden_fake_turn_event_sequence() {
         hooks: HookRegistry::new(),
         workspace: PathBuf::from("/fixture"),
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
 
@@ -235,6 +236,7 @@ async fn set_head_forks_the_item_tree() {
         hooks: HookRegistry::new(),
         workspace: PathBuf::from("/fixture"),
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;
@@ -282,6 +284,7 @@ async fn cancel_turn_preserves_partial_output() {
         hooks: HookRegistry::new(),
         workspace: PathBuf::from("/fixture"),
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;
@@ -357,6 +360,7 @@ async fn workspace_revision_bumps_after_exec() {
         hooks: HookRegistry::new(),
         workspace: PathBuf::from("/fixture"),
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;

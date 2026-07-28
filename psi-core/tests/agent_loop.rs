@@ -152,6 +152,7 @@ async fn the_agent_inspects_edits_and_tests_a_fixture_repository() {
         hooks: HookRegistry::new(),
         workspace: workspace.clone(),
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;
@@ -217,6 +218,7 @@ async fn a_read_outside_the_workspace_root_is_refused_to_the_model() {
         hooks: HookRegistry::new(),
         workspace,
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;
@@ -288,6 +290,7 @@ async fn a_blocking_hook_surfaces_to_the_model_as_a_refused_call() {
         hooks,
         workspace,
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;
@@ -345,6 +348,7 @@ async fn streamed_tool_call_arguments_reach_the_event_stream() {
         hooks: HookRegistry::new(),
         workspace,
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;
@@ -406,6 +410,7 @@ async fn a_response_that_dies_mid_arguments_leaves_no_open_item() {
         hooks: HookRegistry::new(),
         workspace,
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;
@@ -457,6 +462,7 @@ async fn reasoning_provider_data_survives_onto_the_item() {
         hooks: HookRegistry::new(),
         workspace: PathBuf::from("/fixture"),
         sessions_dir: sessions.path().to_path_buf(),
+        trace: None,
     })
     .unwrap();
     let session_id = create_session(&commands, &mut events).await;

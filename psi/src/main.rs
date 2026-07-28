@@ -94,6 +94,8 @@ fn harness() -> Result<(mpsc::Sender<Command>, mpsc::Receiver<Event>), String> {
         hooks: HookRegistry::new(),
         workspace,
         sessions_dir,
+        // Traces are for measured runs; interactive Psi writes none.
+        trace: None,
     })
     .map_err(|err| format!("sessions directory: {err}"))
 }

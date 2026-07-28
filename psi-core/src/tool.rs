@@ -71,6 +71,12 @@ impl ToolRegistry {
         self.tools.iter().find(|tool| tool.spec().name == name)
     }
 
+    /// The registered tools, in advertisement order. The benchmark harness
+    /// reads them to wrap each one in injected latency (`crate::bench`).
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|tool| tool.spec()).collect()
     }

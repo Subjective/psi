@@ -3,6 +3,7 @@
 //!
 //! `docs/design.md` is the authoritative design.
 
+pub mod bench;
 pub mod engine;
 pub mod fake;
 pub mod hook;
@@ -15,5 +16,6 @@ pub mod session;
 pub mod store;
 pub mod tool;
 pub mod tools;
+pub mod trace;
 
 pub use engine::{Harness, HarnessConfig};
