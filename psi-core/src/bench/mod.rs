@@ -9,11 +9,13 @@
 //! binary is a different package, so nothing here ships with it.
 
 mod latency;
+mod oracle;
 mod report;
 mod task;
 
 pub use latency::{Latency, LatencyProfile, LatencyStream, inject_latency};
-pub use report::{Stats, TaskReport, ToolStats};
+pub use oracle::ReplayOracle;
+pub use report::{SpeculationStats, Stats, TaskReport, ToolStats};
 pub use task::{BenchTask, tasks};
 
 use std::path::{Path, PathBuf};
@@ -27,6 +29,7 @@ use crate::hook::HookRegistry;
 use crate::item::{CompletionStatus, ItemPayload};
 use crate::protocol::{Command, Event, EventPayload};
 use crate::session::SessionId;
+use crate::speculation::{SpeculationConfig, v0_allowlist};
 use crate::tools::default_profile;
 use crate::trace::{RunTrace, TraceRecord, TraceWriter};
 use crate::{Harness, HarnessConfig};
@@ -43,6 +46,9 @@ pub struct BenchConfig {
     /// nothing to measure against. The default puts a task near that split
     /// against the default tool profile.
     pub model_delay_ms: u64,
+    /// `Some(execution budget)` drives the run with the replay oracle over the
+    /// v0 allowlist — the perfect-prediction ceiling. `None` is the baseline.
+    pub speculate: Option<usize>,
 }
 
 impl Default for BenchConfig {
@@ -51,6 +57,7 @@ impl Default for BenchConfig {
             trials: 5,
             latency: Latency::measured(),
             model_delay_ms: 2_000,
+            speculate: None,
         }
     }
 }
@@ -90,9 +97,17 @@ pub async fn run_trial(
         started_at_ms: now_ms(),
     })?;
 
-    let script = (task.script)()
+    let script: Vec<_> = (task.script)()
         .into_iter()
-        .map(|response| response.delayed(config.model_delay_ms));
+        .map(|response| response.delayed(config.model_delay_ms))
+        .collect();
+    // The oracle reads the same script the model plays, so its guesses are
+    // exactly the recording's next calls.
+    let speculation = config.speculate.map(|execution_budget| SpeculationConfig {
+        predictor: Arc::new(ReplayOracle::for_script(&script)),
+        allowlist: v0_allowlist(),
+        execution_budget,
+    });
     let (commands, mut events) = Harness::spawn(HarnessConfig {
         model: Arc::new(FakeModel::new(script)),
         tools: inject_latency(default_profile(workspace.clone()), &config.latency),
@@ -100,6 +115,7 @@ pub async fn run_trial(
         workspace: workspace.clone(),
         sessions_dir: dir.join("sessions"),
         trace: Some(trace.clone()),
+        speculation,
     })?;
 
     let session_id = create_session(&commands, &mut events).await;

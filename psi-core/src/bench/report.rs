@@ -7,7 +7,62 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::model::Usage;
-use crate::trace::RunTrace;
+use crate::trace::{RunTrace, TraceRecord};
+
+/// Speculation across every trial, aggregated from the turns' records. The
+/// core metrics of the research question: hit rate and wasted work, read
+/// beside the latency change against a baseline report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpeculationStats {
+    /// Calls the predictor proposed, before filtering.
+    pub proposed: usize,
+    /// Guesses the runtime executed speculatively.
+    pub executed: usize,
+    /// Authoritative calls served from the cache.
+    pub hits: usize,
+    /// Authoritative calls that executed normally.
+    pub misses: usize,
+    /// Executions that never served: invalidated by a mutation or unused at
+    /// turn end.
+    pub wasted: usize,
+}
+
+impl SpeculationStats {
+    /// `None` when the traces hold no speculation records — a baseline.
+    pub fn of(traces: &[RunTrace]) -> Option<Self> {
+        let mut stats = Self::default();
+        let mut any = false;
+        let records = traces
+            .iter()
+            .flat_map(|trace| &trace.turns)
+            .flat_map(|turn| &turn.speculation);
+        for record in records {
+            any = true;
+            match record {
+                TraceRecord::Prediction { calls, .. } => stats.proposed += calls.len(),
+                TraceRecord::SpeculativeExecution { .. } => stats.executed += 1,
+                TraceRecord::Reconciliation { hit, .. } => {
+                    if *hit {
+                        stats.hits += 1;
+                    } else {
+                        stats.misses += 1;
+                    }
+                }
+                TraceRecord::SpeculativeDiscard { .. } => stats.wasted += 1,
+                _ => {}
+            }
+        }
+        any.then_some(stats)
+    }
+
+    /// The fraction of authoritative calls served from the cache.
+    pub fn hit_rate(&self) -> f64 {
+        match self.hits + self.misses {
+            0 => 0.0,
+            calls => self.hits as f64 / calls as f64,
+        }
+    }
+}
 
 /// A measured distribution. Percentiles are nearest-rank over the sorted
 /// samples with no interpolation, so every reported number is a number that
@@ -76,6 +131,8 @@ pub struct TaskReport {
     pub tokens: Usage,
     /// Why turns failed, when any did. Empty for a clean baseline.
     pub errors: Vec<String>,
+    /// Present when the trials speculated.
+    pub speculation: Option<SpeculationStats>,
 }
 
 impl TaskReport {
@@ -122,6 +179,7 @@ impl TaskReport {
                 .collect(),
             tokens,
             errors,
+            speculation: SpeculationStats::of(traces),
         }
     }
 }
@@ -152,6 +210,18 @@ impl fmt::Display for TaskReport {
         }
         for tool in &self.tools {
             row(f, &tool.tool, tool.latency)?;
+        }
+        if let Some(spec) = &self.speculation {
+            writeln!(
+                f,
+                "  speculation: {} proposed, {} executed, {}/{} hits ({:.0}%), {} wasted",
+                spec.proposed,
+                spec.executed,
+                spec.hits,
+                spec.hits + spec.misses,
+                spec.hit_rate() * 100.0,
+                spec.wasted,
+            )?;
         }
         for error in &self.errors {
             writeln!(f, "  error: {error}")?;

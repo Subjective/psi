@@ -199,6 +199,7 @@ async fn live_smoke_test_reads_a_fixture_file() {
         workspace,
         sessions_dir: sessions.path().to_path_buf(),
         trace: None,
+        speculation: None,
     })
     .unwrap();
     commands.send(Command::CreateSession).await.unwrap();

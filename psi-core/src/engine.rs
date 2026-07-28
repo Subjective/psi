@@ -15,9 +15,12 @@ use crate::item::{CompletionStatus, ItemId, ItemKind, ItemPayload, TurnId, Works
 use crate::model::{ModelBackend, ModelEvent, ToolCallRequest, TurnRequest, Usage};
 use crate::protocol::{Command, Event, EventPayload};
 use crate::session::{Session, SessionId};
+use crate::speculation::{
+    CacheEntry, CacheKey, PredictionFuture, SpeculationConfig, SpeculationRuntime,
+};
 use crate::store::SessionStore;
 use crate::tool::{ToolEffect, ToolFuture, ToolInvocation, ToolOutput, ToolRegistry};
-use crate::trace::TraceWriter;
+use crate::trace::{DiscardReason, PredictedCall, TraceRecord, TraceWriter};
 
 /// Everything the engine needs to run. A struct rather than arguments because
 /// `workspace` and `sessions_dir` are two paths that must not be swapped.
@@ -31,9 +34,12 @@ pub struct HarnessConfig {
     pub sessions_dir: PathBuf,
     /// Where this run's trace is written. `Some` only for a measured run: the
     /// Milestone 5 baselines are the consumer, and Milestone 6's speculation
-    /// records will be stamped from the same sequence counter into the same
-    /// file. Interactive Psi passes `None`.
+    /// records are stamped from the same sequence counter into the same file.
+    /// Interactive Psi passes `None`.
     pub trace: Option<TraceWriter>,
+    /// Speculative tool execution. `None` runs the baseline agent loop
+    /// untouched: speculation is optional middleware (docs/design.md).
+    pub speculation: Option<SpeculationConfig>,
 }
 
 pub struct Harness;
@@ -64,6 +70,7 @@ impl Harness {
                 next_seq: 0,
                 trace: config.trace,
             },
+            speculation: config.speculation.map(SpeculationRuntime::new),
         };
         tokio::spawn(engine.run());
         Ok((command_tx, event_rx))
@@ -101,6 +108,18 @@ impl EventSink {
         };
         // A dropped receiver means no client is listening; the engine keeps going.
         let _ = self.tx.send(event).await;
+    }
+
+    /// Stamps a speculation record from the same clock and sequence space as
+    /// the events without emitting any event: speculation adds no interface
+    /// events (docs/design.md, "Speculation"). Without a trace nothing is
+    /// recorded and no sequence number is consumed, so an untraced run's event
+    /// stream is identical with speculation on or off.
+    fn record_speculation(&mut self, make: impl FnOnce(u64, u64) -> TraceRecord) {
+        let Some(trace) = &self.trace else { return };
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let _ = trace.write(&make(seq, now_ms()));
     }
 }
 
@@ -159,6 +178,10 @@ struct Engine {
     /// Commands that arrived mid-turn; replayed in order once the turn ends.
     deferred: VecDeque<Command>,
     events: EventSink,
+    /// The speculation cache and its configuration; `None` is the baseline
+    /// loop. Only the engine task touches it — speculative executions run on
+    /// spawned tasks, but their handles live here.
+    speculation: Option<SpeculationRuntime>,
 }
 
 impl Engine {
@@ -262,6 +285,14 @@ impl Engine {
             .await;
 
         let mut outcome = self.turn_loop(&session_id, &mut session, turn_id).await;
+        // The cache never outlives a turn: whatever is still parked is wasted
+        // work, recorded inside the turn before turn_finished closes it.
+        let unused = self
+            .speculation
+            .as_mut()
+            .map(|spec| spec.drain())
+            .unwrap_or_default();
+        self.record_discards(turn_id, unused, DiscardReason::Unused);
         // A turn whose items did not reach disk did not really complete. A
         // turn that already failed keeps its own error and leaves this one
         // pending, so the report is never lost, only delayed.
@@ -299,6 +330,13 @@ impl Engine {
                 items: session.path_to_head().into_iter().cloned().collect(),
                 tools: self.tools.specs(),
             };
+            // The predictor starts guessing as the authoritative request goes
+            // out: the model's generation time is the window speculation uses.
+            // Dropping the future at round end cancels an unfinished predictor.
+            let mut prediction: Option<PredictionFuture> = self
+                .speculation
+                .as_ref()
+                .map(|spec| spec.predictor().predict(&request));
             let mut stream = self.model.stream_response(request);
 
             let mut open: Option<OpenItem> = None;
@@ -309,12 +347,20 @@ impl Engine {
                 enum Wake {
                     Model(Option<ModelEvent>),
                     Command(Option<Command>),
+                    Prediction(Vec<ToolCallRequest>),
                 }
                 let wake = tokio::select! {
                     event = stream.recv() => Wake::Model(event),
                     command = self.commands.recv() => Wake::Command(command),
+                    guesses = async {
+                        prediction.as_mut().expect("branch enabled only when set").await
+                    }, if prediction.is_some() => Wake::Prediction(guesses),
                 };
                 match wake {
+                    Wake::Prediction(guesses) => {
+                        prediction = None;
+                        self.speculate(turn_id, guesses);
+                    }
                     Wake::Model(Some(ModelEvent::TextDelta { delta })) => {
                         self.stream_delta(
                             session_id,
@@ -578,6 +624,110 @@ impl Engine {
         }
     }
 
+    /// Executes the predictor's guesses, in their order, up to the execution
+    /// budget: each one allowlisted, not already cached, and passed by the
+    /// before-hooks — a call a hook would block is never executed
+    /// speculatively. Results park in the cache; nothing here touches the
+    /// session or emits events.
+    fn speculate(&mut self, turn_id: TurnId, guesses: Vec<ToolCallRequest>) {
+        let Some(spec) = self.speculation.as_mut() else {
+            return;
+        };
+        let budget = spec.execution_budget();
+        self.events
+            .record_speculation(|seq, timestamp_ms| TraceRecord::Prediction {
+                seq,
+                timestamp_ms,
+                turn_id,
+                calls: guesses
+                    .iter()
+                    .map(|call| PredictedCall {
+                        tool: call.tool.clone(),
+                        arguments: call.arguments.clone(),
+                    })
+                    .collect(),
+            });
+
+        let mut started = 0;
+        for call in guesses {
+            if started >= budget {
+                break;
+            }
+            let spec = self.speculation.as_mut().expect("checked above");
+            if !spec.allowlisted(&call.tool) {
+                continue;
+            }
+            let key = CacheKey::new(&call.tool, &call.arguments, &self.workspace, self.revision);
+            if spec.contains(&key) {
+                continue;
+            }
+            let invocation = ToolInvocation {
+                call_id: call.call_id.clone(),
+                arguments: call.arguments.clone(),
+                cwd: self.workspace.clone(),
+            };
+            if let HookDecision::Block { .. } = self.hooks.before(&call.tool, &invocation) {
+                continue;
+            }
+            let Some(tool) = self.tools.get(&call.tool) else {
+                continue;
+            };
+            let handle = tokio::spawn(tool.execute(invocation));
+            let revision = self.revision;
+            self.speculation.as_mut().expect("checked above").insert(
+                key,
+                CacheEntry {
+                    handle,
+                    tool: call.tool.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            );
+            self.events
+                .record_speculation(|seq, timestamp_ms| TraceRecord::SpeculativeExecution {
+                    seq,
+                    timestamp_ms,
+                    turn_id,
+                    tool: call.tool,
+                    arguments: call.arguments,
+                    revision,
+                });
+            started += 1;
+        }
+    }
+
+    /// Bumps the workspace revision and drops every cache entry made against
+    /// the old one, aborting executions still in flight: a stale result must
+    /// never be adopted.
+    fn bump_revision(&mut self, turn_id: TurnId) {
+        self.revision = WorkspaceRevision(self.revision.0 + 1);
+        let stale = self
+            .speculation
+            .as_mut()
+            .map(|spec| spec.invalidate(self.revision))
+            .unwrap_or_default();
+        self.record_discards(turn_id, stale, DiscardReason::Invalidated);
+    }
+
+    fn record_discards(
+        &mut self,
+        turn_id: TurnId,
+        discarded: Vec<crate::speculation::Discarded>,
+        reason: DiscardReason,
+    ) {
+        for entry in discarded {
+            self.events
+                .record_speculation(|seq, timestamp_ms| TraceRecord::SpeculativeDiscard {
+                    seq,
+                    timestamp_ms,
+                    turn_id,
+                    tool: entry.tool,
+                    arguments: entry.arguments,
+                    finished: entry.finished,
+                    reason,
+                });
+        }
+    }
+
     /// Runs one authoritative tool call through to its tool_result item.
     /// Returns false if the turn was cancelled while the call ran.
     async fn execute_call(
@@ -615,8 +765,31 @@ impl Engine {
             HookDecision::Continue => None,
         };
         let ran = refusal.is_none();
-        let (effect, mut future): (ToolEffect, ToolFuture) = match refusal {
-            Some(message) => {
+        // Reconciliation: an exact cache-key lookup. A refused call is not
+        // reconciled — it never runs, so it neither hits nor misses.
+        let adopted = if ran && self.speculation.is_some() {
+            let key = CacheKey::new(&call.tool, &call.arguments, &self.workspace, self.revision);
+            let entry = self.speculation.as_mut().and_then(|spec| spec.take(&key));
+            let (hit, finished) = match &entry {
+                Some(entry) => (true, Some(entry.handle.is_finished())),
+                None => (false, None),
+            };
+            self.events
+                .record_speculation(|seq, timestamp_ms| TraceRecord::Reconciliation {
+                    seq,
+                    timestamp_ms,
+                    turn_id,
+                    tool: call.tool.clone(),
+                    arguments: call.arguments.clone(),
+                    hit,
+                    finished,
+                });
+            entry
+        } else {
+            None
+        };
+        let (effect, mut future): (ToolEffect, ToolFuture) = match (refusal, adopted) {
+            (Some(message), _) => {
                 let output = ToolOutput {
                     content: message.clone(),
                     error: Some(message),
@@ -624,7 +797,27 @@ impl Engine {
                 };
                 (ToolEffect::ReadOnly, Box::pin(async move { output }))
             }
-            None => {
+            (None, Some(entry)) => {
+                // The adopted future finishes immediately or is awaited in
+                // flight; either way the item's duration is the time this call
+                // actually waited, which is the latency speculation saved.
+                let tool = self.tools.get(&call.tool).expect("checked above");
+                let handle = entry.handle;
+                let future: ToolFuture = Box::pin(async move {
+                    match handle.await {
+                        Ok(output) => output,
+                        // A panicked speculative task is a tool bug either
+                        // way; surface it rather than quietly re-running.
+                        Err(err) => ToolOutput {
+                            content: format!("speculative execution failed: {err}"),
+                            error: Some(format!("speculative execution failed: {err}")),
+                            truncated: false,
+                        },
+                    }
+                });
+                (tool.effect(), future)
+            }
+            (None, None) => {
                 let tool = self.tools.get(&call.tool).expect("checked above");
                 (tool.effect(), tool.execute(invocation.clone()))
             }
@@ -668,7 +861,7 @@ impl Engine {
                     ToolEffect::Unknown => true,
                 };
                 if bump {
-                    self.revision = WorkspaceRevision(self.revision.0 + 1);
+                    self.bump_revision(turn_id);
                 }
                 let payload = ItemPayload::ToolResult {
                     call_id: call.call_id.clone(),
@@ -687,7 +880,7 @@ impl Engine {
                 // Cancelled while the tool ran. A killed call may already have
                 // mutated, so anything not read-only still bumps the revision.
                 if effect != ToolEffect::ReadOnly {
-                    self.revision = WorkspaceRevision(self.revision.0 + 1);
+                    self.bump_revision(turn_id);
                 }
                 let payload = ItemPayload::ToolResult {
                     call_id: call.call_id.clone(),

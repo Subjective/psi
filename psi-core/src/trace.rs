@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::item::{CompletionStatus, Item, ItemPayload, TurnId};
+use crate::item::{CompletionStatus, Item, ItemPayload, TurnId, WorkspaceRevision};
 use crate::model::Usage;
 use crate::protocol::EventPayload;
 
@@ -67,8 +67,65 @@ pub enum TraceRecord {
         error: Option<String>,
         usage: Option<Usage>,
     },
+    /// The predictor's guesses for one model response, before filtering, so
+    /// prediction quality is measurable apart from what the budget let run.
+    Prediction {
+        seq: u64,
+        timestamp_ms: u64,
+        turn_id: TurnId,
+        calls: Vec<PredictedCall>,
+    },
+    /// One guess the runtime started executing: allowlisted, uncached,
+    /// unblocked, and within the execution budget.
+    SpeculativeExecution {
+        seq: u64,
+        timestamp_ms: u64,
+        turn_id: TurnId,
+        tool: String,
+        arguments: serde_json::Value,
+        revision: WorkspaceRevision,
+    },
+    /// How one authoritative call met the cache: a hit adopted the entry
+    /// (`finished` says whether it was still in flight), a miss executed
+    /// normally. Hit rate is the core metric and this is its record.
+    Reconciliation {
+        seq: u64,
+        timestamp_ms: u64,
+        turn_id: TurnId,
+        tool: String,
+        arguments: serde_json::Value,
+        hit: bool,
+        finished: Option<bool>,
+    },
+    /// A cache entry that never served: wasted work, the cost side of the
+    /// research question.
+    SpeculativeDiscard {
+        seq: u64,
+        timestamp_ms: u64,
+        turn_id: TurnId,
+        tool: String,
+        arguments: serde_json::Value,
+        finished: bool,
+        reason: DiscardReason,
+    },
     /// The terminator: whether the run met its task's success criterion.
     Outcome { success: bool },
+}
+
+/// One guessed call, as the predictor proposed it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictedCall {
+    pub tool: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscardReason {
+    /// A mutation bumped the revision out from under the entry.
+    Invalidated,
+    /// The turn ended with the entry still parked.
+    Unused,
 }
 
 /// The append end of one trace. Two writers share it — the engine, which
@@ -164,6 +221,9 @@ pub struct TurnTrace {
     pub usage: Option<Usage>,
     /// Every item of the turn, in append order.
     pub items: Vec<Item>,
+    /// The turn's speculation records, in stamp order — empty for a baseline.
+    /// `crate::bench::SpeculationStats` aggregates them.
+    pub speculation: Vec<TraceRecord>,
 }
 
 /// One tool call and what it cost, paired from the trace's `tool_call` and
@@ -183,8 +243,9 @@ impl RunTrace {
     pub fn read(path: &Path) -> io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let mut run: Option<RunTrace> = None;
-        // The turn being assembled: its id, when it started, and its items.
-        let mut open: Option<(TurnId, u64, Vec<Item>)> = None;
+        // The turn being assembled: its id, when it started, its items, and
+        // its speculation records.
+        let mut open: Option<(TurnId, u64, Vec<Item>, Vec<TraceRecord>)> = None;
         let mut closed = false;
 
         for (index, line) in text.lines().enumerate() {
@@ -224,11 +285,21 @@ impl RunTrace {
                     },
                     Some(_),
                 ) if open.is_none() => {
-                    open = Some((turn_id, timestamp_ms, Vec::new()));
+                    open = Some((turn_id, timestamp_ms, Vec::new(), Vec::new()));
                 }
                 (TraceRecord::Item { item, .. }, Some(_)) => match open.as_mut() {
-                    Some((_, _, items)) => items.push(item),
+                    Some((_, _, items, _)) => items.push(item),
                     None => return Err(defect("an item outside a turn")),
+                },
+                (
+                    record @ (TraceRecord::Prediction { .. }
+                    | TraceRecord::SpeculativeExecution { .. }
+                    | TraceRecord::Reconciliation { .. }
+                    | TraceRecord::SpeculativeDiscard { .. }),
+                    Some(_),
+                ) => match open.as_mut() {
+                    Some((_, _, _, speculation)) => speculation.push(record),
+                    None => return Err(defect("a speculation record outside a turn")),
                 },
                 (
                     TraceRecord::TurnFinished {
@@ -241,7 +312,7 @@ impl RunTrace {
                     },
                     Some(run),
                 ) => {
-                    let Some((open_id, started_at_ms, items)) = open.take() else {
+                    let Some((open_id, started_at_ms, items, speculation)) = open.take() else {
                         return Err(defect("a turn finished that never started"));
                     };
                     if open_id != turn_id {
@@ -255,6 +326,7 @@ impl RunTrace {
                         error,
                         usage,
                         items,
+                        speculation,
                     });
                 }
                 (TraceRecord::Outcome { success }, Some(run)) if open.is_none() => {

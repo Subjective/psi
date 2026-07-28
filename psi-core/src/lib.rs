@@ -13,6 +13,7 @@ pub mod openai;
 pub mod protocol;
 pub mod responses;
 pub mod session;
+pub mod speculation;
 pub mod store;
 pub mod tool;
 pub mod tools;

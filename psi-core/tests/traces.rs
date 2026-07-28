@@ -26,6 +26,7 @@ fn test_config(trials: u32) -> BenchConfig {
         trials,
         latency: Latency::fixed(10),
         model_delay_ms: 5,
+        speculate: None,
     }
 }
 

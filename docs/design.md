@@ -144,7 +144,7 @@ Psi follows Pi: it assumes a trusted or externally sandboxed environment and shi
 
 - Structured file tools enforce workspace roots in-process.
 - `exec` inherits Psi's process permissions; run Psi in a container for untrusted work, and Psi says so plainly.
-- A small serial in-process hook seam (compiled-in Rust, registered at harness construction) runs before and after every authoritative tool call; selection also applies before-hooks to predictions, so a call a hook would block is never executed speculatively. A hook returns continue or block; a block is reported to the model as a refused call. This seam is where any future policy would attach, including interactive approval if it is ever wanted.
+- A small serial in-process hook seam (compiled-in Rust, registered at harness construction) runs before and after every authoritative tool call; selection also applies before-hooks to predictions, so a call a hook would block is never executed speculatively. After-hooks observe adopted speculative results too: the call ran, only earlier. A hook returns continue or block; a block is reported to the model as a refused call. This seam is where any future policy would attach, including interactive approval if it is ever wanted.
 
 ### Model backends: one Responses codec, explicit capabilities
 
