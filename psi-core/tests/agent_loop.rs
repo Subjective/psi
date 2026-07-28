@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use psi_core::Harness;
 use psi_core::fake::{FakeModel, FakeResponse};
 use psi_core::hook::{Hook, HookDecision, HookRegistry};
 use psi_core::item::{CompletionStatus, ItemPayload};
@@ -18,6 +17,7 @@ use psi_core::protocol::{Command, Event, EventPayload};
 use psi_core::session::{SessionId, SessionSnapshot};
 use psi_core::tool::{ToolInvocation, ToolOutput};
 use psi_core::tools::default_profile;
+use psi_core::{Harness, HarnessConfig};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -145,12 +145,15 @@ async fn the_agent_inspects_edits_and_tests_a_fixture_repository() {
         one_call("exec", "call-5", json!({ "command": "sh test.sh" })),
         text("Fixed: answer now returns 42 and the test passes."),
     ]);
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        default_profile(workspace.clone()),
-        HookRegistry::new(),
-        workspace.clone(),
-    );
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: default_profile(workspace.clone()),
+        hooks: HookRegistry::new(),
+        workspace: workspace.clone(),
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     let status = run_turn(&commands, &mut events, &session_id, "make the test pass").await;
@@ -207,12 +210,15 @@ async fn a_read_outside_the_workspace_root_is_refused_to_the_model() {
         ),
         text("I cannot read outside the workspace."),
     ]);
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        default_profile(workspace.clone()),
-        HookRegistry::new(),
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: default_profile(workspace.clone()),
+        hooks: HookRegistry::new(),
         workspace,
-    );
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     let status = run_turn(&commands, &mut events, &session_id, "read the secret").await;
@@ -275,12 +281,15 @@ async fn a_blocking_hook_surfaces_to_the_model_as_a_refused_call() {
         before_calls: before_calls.clone(),
         after_calls: after_calls.clone(),
     });
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        default_profile(workspace.clone()),
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: default_profile(workspace.clone()),
         hooks,
         workspace,
-    );
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     let status = run_turn(&commands, &mut events, &session_id, "clean up").await;
@@ -329,12 +338,15 @@ async fn streamed_tool_call_arguments_reach_the_event_stream() {
     ]);
     let dir = fixture();
     let workspace = dir.path().to_path_buf();
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        default_profile(workspace.clone()),
-        HookRegistry::new(),
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: default_profile(workspace.clone()),
+        hooks: HookRegistry::new(),
         workspace,
-    );
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     commands
@@ -387,12 +399,15 @@ async fn a_response_that_dies_mid_arguments_leaves_no_open_item() {
     ])]);
     let dir = fixture();
     let workspace = dir.path().to_path_buf();
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        default_profile(workspace.clone()),
-        HookRegistry::new(),
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: default_profile(workspace.clone()),
+        hooks: HookRegistry::new(),
         workspace,
-    );
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     let status = run_turn(&commands, &mut events, &session_id, "read it").await;
@@ -435,12 +450,15 @@ async fn reasoning_provider_data_survives_onto_the_item() {
         },
         ModelEvent::Completed,
     ])]);
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        default_profile(PathBuf::from("/fixture")),
-        HookRegistry::new(),
-        PathBuf::from("/fixture"),
-    );
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: default_profile(PathBuf::from("/fixture")),
+        hooks: HookRegistry::new(),
+        workspace: PathBuf::from("/fixture"),
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     commands

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use psi_core::Harness;
 use psi_core::fake::{FakeModel, FakeResponse, FakeTool};
 use psi_core::hook::HookRegistry;
 use psi_core::item::{CompletionStatus, ItemId, ItemPayload, TurnId};
@@ -14,6 +13,7 @@ use psi_core::model::{ModelEvent, ToolCallRequest};
 use psi_core::protocol::{Command, Event, EventPayload};
 use psi_core::session::{SessionId, SessionSnapshot};
 use psi_core::tool::{ToolEffect, ToolRegistry};
+use psi_core::{Harness, HarnessConfig};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -143,12 +143,15 @@ async fn golden_fake_turn_event_sequence() {
         ToolEffect::ReadOnly,
         "fake file contents",
     ));
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
         tools,
-        HookRegistry::new(),
-        PathBuf::from("/fixture"),
-    );
+        hooks: HookRegistry::new(),
+        workspace: PathBuf::from("/fixture"),
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
 
     let session_id = create_session(&commands, &mut events).await;
     let turn = submit_and_collect(&commands, &mut events, &session_id, "Read the readme").await;
@@ -225,12 +228,15 @@ async fn set_head_forks_the_item_tree() {
         text_response("two"),
         text_response("three"),
     ]);
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        ToolRegistry::new(),
-        HookRegistry::new(),
-        PathBuf::from("/fixture"),
-    );
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: ToolRegistry::new(),
+        hooks: HookRegistry::new(),
+        workspace: PathBuf::from("/fixture"),
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     submit_and_collect(&commands, &mut events, &session_id, "first").await;
@@ -269,12 +275,15 @@ async fn cancel_turn_preserves_partial_output() {
     let model = FakeModel::new([FakeResponse::hanging(vec![ModelEvent::TextDelta {
         delta: "partial".into(),
     }])]);
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
-        ToolRegistry::new(),
-        HookRegistry::new(),
-        PathBuf::from("/fixture"),
-    );
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
+        tools: ToolRegistry::new(),
+        hooks: HookRegistry::new(),
+        workspace: PathBuf::from("/fixture"),
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     commands
@@ -341,12 +350,15 @@ async fn workspace_revision_bumps_after_exec() {
         ToolEffect::ReadOnly,
         "contents",
     ));
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(model),
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(model),
         tools,
-        HookRegistry::new(),
-        PathBuf::from("/fixture"),
-    );
+        hooks: HookRegistry::new(),
+        workspace: PathBuf::from("/fixture"),
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     let session_id = create_session(&commands, &mut events).await;
 
     submit_and_collect(&commands, &mut events, &session_id, "touch then read").await;

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use psi_core::Harness;
 use psi_core::hook::HookRegistry;
 use psi_core::item::{CompletionStatus, ItemPayload};
 use psi_core::model::{ModelBackend, ModelEvent, TurnRequest};
@@ -14,6 +13,7 @@ use psi_core::openai::{OpenAiBackend, OpenAiConfig};
 use psi_core::protocol::{Command, EventPayload};
 use psi_core::session::SessionId;
 use psi_core::tools::default_profile;
+use psi_core::{Harness, HarnessConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -191,12 +191,15 @@ async fn live_smoke_test_reads_a_fixture_file() {
     );
     let backend = OpenAiBackend::new(config).expect("OPENAI_API_KEY");
 
-    let (commands, mut events) = Harness::spawn(
-        Arc::new(backend),
-        default_profile(workspace.clone()),
-        HookRegistry::new(),
+    let sessions = tempfile::tempdir().unwrap();
+    let (commands, mut events) = Harness::spawn(HarnessConfig {
+        model: Arc::new(backend),
+        tools: default_profile(workspace.clone()),
+        hooks: HookRegistry::new(),
         workspace,
-    );
+        sessions_dir: sessions.path().to_path_buf(),
+    })
+    .unwrap();
     commands.send(Command::CreateSession).await.unwrap();
     let session_id = match events.recv().await.unwrap().payload {
         EventPayload::SessionCreated { meta } => meta.id,

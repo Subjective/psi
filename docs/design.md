@@ -126,6 +126,10 @@ The composer is Psi's own modal state machine over a `ropey` text buffer, struct
 
 One file per session, one item per line, plus the `head` pointer. History is never mutated; edits fork. This costs storage but buys free branching, trivial resume, greppable sessions, and reproducible replay. SQLite only if search or scale later demands it.
 
+A file is a header line of session metadata followed by the only two mutations a session tree has: an item is appended, or `head` moves. Appending an item always moves `head` onto it, so an item line carries its own head move and only `set_head` needs a line of its own; on load, the last line that touches `head` wins. Items are written as they finish rather than at the end of a turn, so a crash costs at most the record being written.
+
+A log is valid up to its first defect: a final line with no terminating newline, a line that does not parse, or a record that contradicts the tree. Loading drops everything from there on and truncates the file to that point, so the prefix a reader accepted is exactly what the next append extends, and a record that survives can never reference one that did not.
+
 ### Five tools, one profile
 
 Default tools: `read_file`, `list_directory`, `search`, `apply_patch`, `exec`.

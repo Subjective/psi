@@ -15,27 +15,40 @@ use crate::item::{CompletionStatus, ItemId, ItemKind, ItemPayload, TurnId, Works
 use crate::model::{ModelBackend, ModelEvent, ToolCallRequest, TurnRequest, Usage};
 use crate::protocol::{Command, Event, EventPayload};
 use crate::session::{Session, SessionId};
+use crate::store::SessionStore;
 use crate::tool::{ToolEffect, ToolFuture, ToolInvocation, ToolOutput, ToolRegistry};
+
+/// Everything the engine needs to run. A struct rather than arguments because
+/// `workspace` and `sessions_dir` are two paths that must not be swapped.
+pub struct HarnessConfig {
+    pub model: Arc<dyn ModelBackend>,
+    pub tools: ToolRegistry,
+    /// Registered here and nowhere else.
+    pub hooks: HookRegistry,
+    pub workspace: PathBuf,
+    /// Where session logs live; created if missing.
+    pub sessions_dir: PathBuf,
+}
 
 pub struct Harness;
 
 impl Harness {
     /// Spawns the engine task and returns the command/event channel pair —
-    /// the in-process form of the interface protocol. Hooks are registered
-    /// here and nowhere else.
+    /// the in-process form of the interface protocol. Fails when the sessions
+    /// directory cannot be opened, before any client can be waiting on an
+    /// event that would never come.
     pub fn spawn(
-        model: Arc<dyn ModelBackend>,
-        tools: ToolRegistry,
-        hooks: HookRegistry,
-        workspace: PathBuf,
-    ) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>) {
+        config: HarnessConfig,
+    ) -> std::io::Result<(mpsc::Sender<Command>, mpsc::Receiver<Event>)> {
+        let store = SessionStore::new(config.sessions_dir)?;
         let (command_tx, command_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(256);
         let engine = Engine {
-            model,
-            tools,
-            hooks,
-            workspace,
+            model: config.model,
+            tools: config.tools,
+            hooks: config.hooks,
+            workspace: config.workspace,
+            store,
             revision: WorkspaceRevision(0),
             sessions: HashMap::new(),
             commands: command_rx,
@@ -44,10 +57,9 @@ impl Harness {
                 tx: event_tx,
                 next_seq: 0,
             },
-            created_sessions: 0,
         };
         tokio::spawn(engine.run());
-        (command_tx, event_rx)
+        Ok((command_tx, event_rx))
     }
 }
 
@@ -121,15 +133,17 @@ struct Engine {
     tools: ToolRegistry,
     hooks: HookRegistry,
     workspace: PathBuf,
+    store: SessionStore,
     /// One harness serves one workspace, so one revision counter is shared by
     /// every session.
     revision: WorkspaceRevision,
+    /// Sessions loaded into memory. Every one of them is also on disk; this is
+    /// the working set, not the record.
     sessions: HashMap<SessionId, Session>,
     commands: mpsc::Receiver<Command>,
     /// Commands that arrived mid-turn; replayed in order once the turn ends.
     deferred: VecDeque<Command>,
     events: EventSink,
-    created_sessions: u64,
 }
 
 impl Engine {
@@ -142,31 +156,44 @@ impl Engine {
                     None => return,
                 },
             };
-            self.handle(command).await;
+            if !self.handle(command).await {
+                return;
+            }
         }
     }
 
-    async fn handle(&mut self, command: Command) {
+    /// Returns false when the engine must stop.
+    async fn handle(&mut self, command: Command) -> bool {
         match command {
             Command::CreateSession => {
-                let id = SessionId(format!("s{}-{}", self.created_sessions, now_ms()));
-                self.created_sessions += 1;
-                let session = Session::new(id.clone(), now_ms());
-                let meta = session.meta.clone();
-                self.sessions.insert(id.clone(), session);
+                // A store that cannot start a session cannot serve any, and no
+                // event would ever answer this command. Stopping closes the
+                // event stream, which clients already read as the harness
+                // going away.
+                let Ok((meta, log)) = self.store.create(now_ms()) else {
+                    return false;
+                };
+                let id = meta.id.clone();
+                self.sessions
+                    .insert(id.clone(), Session::new(meta.clone(), log));
                 self.emit(&id, EventPayload::SessionCreated { meta }).await;
             }
             Command::LoadSession { session_id } => {
-                // Unknown ids are dropped; sessions live only in memory until
-                // persistence lands (Milestone 3).
-                if let Some(session) = self.sessions.get(&session_id) {
-                    let snapshot = session.snapshot();
-                    self.emit(&session_id, EventPayload::SessionLoaded { snapshot })
-                        .await;
+                // An id that names nothing on disk is a client mistake, not a
+                // broken store: the command is dropped.
+                if !self.sessions.contains_key(&session_id) {
+                    let Ok((snapshot, log)) = self.store.load(&session_id) else {
+                        return true;
+                    };
+                    self.sessions
+                        .insert(session_id.clone(), Session::restore(snapshot, log));
                 }
+                let snapshot = self.sessions[&session_id].snapshot();
+                self.emit(&session_id, EventPayload::SessionLoaded { snapshot })
+                    .await;
             }
             Command::ListSessions => {
-                let sessions = self.sessions.values().map(|s| s.meta.clone()).collect();
+                let sessions = self.store.list();
                 self.events
                     .emit(None, EventPayload::SessionsListed { sessions })
                     .await;
@@ -184,6 +211,7 @@ impl Engine {
                 self.run_turn(session_id, text).await;
             }
         }
+        true
     }
 
     async fn run_turn(&mut self, session_id: SessionId, text: String) {
@@ -218,7 +246,16 @@ impl Engine {
         self.emit(&session_id, EventPayload::ItemFinished { item })
             .await;
 
-        let outcome = self.turn_loop(&session_id, &mut session, turn_id).await;
+        let mut outcome = self.turn_loop(&session_id, &mut session, turn_id).await;
+        // A turn whose items did not reach disk did not really complete. A
+        // turn that already failed keeps its own error and leaves this one
+        // pending, so the report is never lost, only delayed.
+        if outcome.status == CompletionStatus::Completed
+            && let Some(error) = session.take_log_error()
+        {
+            outcome.status = CompletionStatus::Failed;
+            outcome.error = Some(error);
+        }
         self.emit(
             &session_id,
             EventPayload::TurnFinished {
