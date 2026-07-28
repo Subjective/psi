@@ -4,5 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crossterm = "0.29"
 psi-core = { path = "../psi-core" }
+# Only the crossterm backend is drawn on; the default set also pulls the
+# calendar widget, the layout cache, and the macro crate, none of which the
+# viewport uses.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ropey = "1.6"
+# Tool-call arguments cross the protocol as `serde_json::Value`; rendering a
+# diff means reading one.
+serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
