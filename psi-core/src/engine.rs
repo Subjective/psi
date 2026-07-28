@@ -12,11 +12,11 @@ use tokio::sync::mpsc;
 
 use crate::hook::{HookDecision, HookRegistry};
 use crate::item::{CompletionStatus, ItemId, ItemKind, ItemPayload, TurnId, WorkspaceRevision};
-use crate::model::{ModelBackend, ModelEvent, ToolCallRequest, TurnRequest, Usage};
+use crate::model::{ModelBackend, ModelEvent, Sampling, ToolCallRequest, TurnRequest, Usage};
 use crate::protocol::{Command, Event, EventPayload};
 use crate::session::{Session, SessionId};
 use crate::speculation::{
-    CacheEntry, CacheKey, PredictionFuture, SpeculationConfig, SpeculationRuntime,
+    CacheEntry, CacheKey, Prediction, PredictionFuture, SpeculationConfig, SpeculationRuntime,
 };
 use crate::store::SessionStore;
 use crate::tool::{ToolEffect, ToolFuture, ToolInvocation, ToolOutput, ToolRegistry};
@@ -329,6 +329,9 @@ impl Engine {
                 session_id: session_id.clone(),
                 items: session.path_to_head().into_iter().cloned().collect(),
                 tools: self.tools.specs(),
+                // The authoritative turn takes the target's own sampling
+                // defaults; only the predictor overrides them.
+                sampling: Sampling::default(),
             };
             // The predictor starts guessing as the authoritative request goes
             // out: the model's generation time is the window speculation uses.
@@ -336,7 +339,7 @@ impl Engine {
             let mut prediction: Option<PredictionFuture> = self
                 .speculation
                 .as_ref()
-                .map(|spec| spec.predictor().predict(&request));
+                .map(|spec| spec.predictor().predict(&request, spec.prediction_budget()));
             let mut stream = self.model.stream_response(request);
 
             let mut open: Option<OpenItem> = None;
@@ -347,17 +350,17 @@ impl Engine {
                 enum Wake {
                     Model(Option<ModelEvent>),
                     Command(Option<Command>),
-                    Prediction(Vec<ToolCallRequest>),
+                    Predicted(Prediction),
                 }
                 let wake = tokio::select! {
                     event = stream.recv() => Wake::Model(event),
                     command = self.commands.recv() => Wake::Command(command),
                     guesses = async {
                         prediction.as_mut().expect("branch enabled only when set").await
-                    }, if prediction.is_some() => Wake::Prediction(guesses),
+                    }, if prediction.is_some() => Wake::Predicted(guesses),
                 };
                 match wake {
-                    Wake::Prediction(guesses) => {
+                    Wake::Predicted(guesses) => {
                         prediction = None;
                         self.speculate(turn_id, guesses);
                     }
@@ -629,11 +632,16 @@ impl Engine {
     /// before-hooks — a call a hook would block is never executed
     /// speculatively. Results park in the cache; nothing here touches the
     /// session or emits events.
-    fn speculate(&mut self, turn_id: TurnId, guesses: Vec<ToolCallRequest>) {
+    fn speculate(&mut self, turn_id: TurnId, prediction: Prediction) {
         let Some(spec) = self.speculation.as_mut() else {
             return;
         };
         let budget = spec.execution_budget();
+        let Prediction {
+            calls: guesses,
+            usage,
+            error,
+        } = prediction;
         self.events
             .record_speculation(|seq, timestamp_ms| TraceRecord::Prediction {
                 seq,
@@ -646,6 +654,8 @@ impl Engine {
                         arguments: call.arguments.clone(),
                     })
                     .collect(),
+                usage,
+                error,
             });
 
         let mut started = self

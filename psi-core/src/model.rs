@@ -14,6 +14,21 @@ pub struct TurnRequest {
     pub session_id: SessionId,
     pub items: Vec<Item>,
     pub tools: Vec<ToolSpec>,
+    pub sampling: Sampling,
+}
+
+/// Sampling overrides for one request. The authoritative turn leaves both unset
+/// and takes the server's own defaults; the prediction strategies set them
+/// (`crate::predictor`), because the prediction budget is a cap on generated
+/// tokens and branch sampling needs a temperature above zero for its samples to
+/// differ. A field is only rendered into the request body when it is set, so an
+/// OpenAI reasoning model — which rejects `temperature` outright — is never
+/// sent one by the authoritative path.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Sampling {
+    pub temperature: Option<f64>,
+    /// The generated-token cap, which is what the prediction budget bounds.
+    pub max_output_tokens: Option<u64>,
 }
 
 /// A completed tool call proposed by the model.

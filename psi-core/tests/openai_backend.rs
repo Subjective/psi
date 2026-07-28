@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use psi_core::hook::HookRegistry;
 use psi_core::item::{CompletionStatus, ItemPayload};
-use psi_core::model::{ModelBackend, ModelEvent, TurnRequest};
+use psi_core::model::{ModelBackend, ModelEvent, Sampling, TurnRequest};
 use psi_core::openai::{OpenAiBackend, OpenAiConfig};
 use psi_core::protocol::{Command, EventPayload};
 use psi_core::session::SessionId;
@@ -77,6 +77,7 @@ fn empty_request() -> TurnRequest {
         session_id: SessionId("s0".to_string()),
         items: Vec::new(),
         tools: Vec::new(),
+        sampling: Sampling::default(),
     }
 }
 

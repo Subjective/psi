@@ -72,6 +72,14 @@ pub fn build_request(
     if capabilities.encrypted_reasoning_replay {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
+    // Both targets take these under their OpenAI names, so they need no
+    // capability of their own; an unset one is left out of the body entirely.
+    if let Some(temperature) = request.sampling.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(max_output_tokens) = request.sampling.max_output_tokens {
+        body["max_output_tokens"] = json!(max_output_tokens);
+    }
     body
 }
 

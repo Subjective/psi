@@ -17,9 +17,22 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use crate::chat;
 use crate::model::{ModelBackend, ModelEvent, TurnRequest};
 use crate::openai::{BackendError, DEFAULT_INSTRUCTIONS};
 use crate::responses::{Capabilities, Decoder, SseBuffer, build_request};
+
+/// Which endpoint a target is driven through. Responses is the one Psi is built
+/// on; Chat Completions exists only as a predictor-side config switch, for
+/// model-parser combinations whose Responses streaming misbehaves (docs/
+/// design.md, "Model backends"). The authoritative loop needs streaming and
+/// never selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Endpoint {
+    #[default]
+    Responses,
+    ChatCompletions,
+}
 
 /// Where the backend points and how long it waits.
 ///
@@ -32,6 +45,15 @@ use crate::responses::{Capabilities, Decoder, SseBuffer, build_request};
 /// told apart from a model that simply chose to answer, so the backend reports
 /// a configuration error while the target has never yet completed a tool call,
 /// and stops checking once it has. See `VllmBackend`.
+///
+/// A predictor target meets the same guard, and legitimately proposes nothing
+/// sometimes. That is the guard's premise holding rather than misfiring: while
+/// a target has never returned a parsed call, an empty reply really is
+/// ambiguous, and either reading produces the same prediction — a round with
+/// zero proposals, which `crate::predictor` records in the trace along with the
+/// guard's message as the round's reason. The predictor's first proposed call
+/// clears the flag for good; if the parser really is missing, every round
+/// carries the message and the hit rate is zero, which is the diagnosis.
 #[derive(Debug, Clone)]
 pub struct VllmConfig {
     /// The served model name. Empty means the model the server already
@@ -49,8 +71,13 @@ pub struct VllmConfig {
     /// How long the request may take to produce response headers.
     pub request_timeout: Duration,
     /// How long the stream may go quiet before the round fails. Stream silence
-    /// is never success.
+    /// is never success. The Chat Completions path has no stream — vLLM sends
+    /// its headers only once generation is done — so there it bounds the whole
+    /// exchange instead, which is the same thing measured end to end.
     pub idle_timeout: Duration,
+    /// The predictor's fallback switch; the default is the Responses endpoint
+    /// the rest of Psi is built on.
+    pub endpoint: Endpoint,
 }
 
 impl Default for VllmConfig {
@@ -62,6 +89,7 @@ impl Default for VllmConfig {
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             request_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(120),
+            endpoint: Endpoint::Responses,
         }
     }
 }
@@ -101,27 +129,41 @@ impl ModelBackend for VllmBackend {
             tools_advertised: !request.tools.is_empty(),
             unproven: self.tool_parser_unproven.clone(),
         };
-        let body = build_request(
-            &self.config.model,
-            &self.config.instructions,
-            Capabilities::VLLM,
-            &request,
-        );
-        let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
+        let base_url = self.config.base_url.trim_end_matches('/');
+        let (url, body) = match self.config.endpoint {
+            Endpoint::Responses => (
+                format!("{base_url}/responses"),
+                build_request(
+                    &self.config.model,
+                    &self.config.instructions,
+                    Capabilities::VLLM,
+                    &request,
+                ),
+            ),
+            Endpoint::ChatCompletions => (
+                format!("{base_url}/chat/completions"),
+                chat::build_request(&self.config.model, &self.config.instructions, &request),
+            ),
+        };
         // Auth is the transport difference: a keyless server is sent no
         // `authorization` header at all rather than an empty one.
-        let mut post = self
-            .http
-            .post(&url)
-            .header("accept", "text/event-stream")
-            .json(&body);
+        let mut post = self.http.post(&url).json(&body);
+        if self.config.endpoint == Endpoint::Responses {
+            post = post.header("accept", "text/event-stream");
+        }
         if let Some(api_key) = &self.api_key {
             post = post.bearer_auth(api_key);
         }
         let request_timeout = self.config.request_timeout;
         let idle_timeout = self.config.idle_timeout;
+        let endpoint = self.config.endpoint;
         tokio::spawn(async move {
-            stream(post, request_timeout, idle_timeout, guard, events).await;
+            match endpoint {
+                Endpoint::Responses => {
+                    stream(post, request_timeout, idle_timeout, guard, events).await
+                }
+                Endpoint::ChatCompletions => complete(post, idle_timeout, guard, events).await,
+            }
         });
         receiver
     }
@@ -217,6 +259,52 @@ async fn stream(
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Reads one whole Chat Completions reply. Cancellation is still the receiver
+/// going away: returning here drops the pending response and closes the
+/// connection, exactly as the streaming path does.
+async fn complete(
+    post: reqwest::RequestBuilder,
+    reply_timeout: Duration,
+    guard: Guard,
+    events: mpsc::Sender<ModelEvent>,
+) {
+    let exchange = async {
+        let response = post.send().await?;
+        let status = response.status();
+        Ok::<_, reqwest::Error>((status, response.text().await?))
+    };
+    let reply = tokio::select! {
+        _ = events.closed() => return,
+        reply = timeout(reply_timeout, exchange) => reply,
+    };
+    let (status, body) = match reply {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(err)) => return fail(&events, format!("vllm chat request failed: {err}")).await,
+        Err(_) => {
+            return fail(
+                &events,
+                format!("vllm chat did not reply within {reply_timeout:?}"),
+            )
+            .await;
+        }
+    };
+    if !status.is_success() {
+        let body: String = body.chars().take(500).collect();
+        return fail(&events, format!("vllm chat returned {status}: {body}")).await;
+    }
+    let Ok(reply) = serde_json::from_str::<serde_json::Value>(&body) else {
+        let body: String = body.chars().take(500).collect();
+        return fail(&events, format!("vllm chat sent a non-JSON reply: {body}")).await;
+    };
+    for event in chat::decode_response(&reply) {
+        let event = guard.observe(event);
+        let terminal = matches!(event, ModelEvent::Completed | ModelEvent::Error { .. });
+        if events.send(event).await.is_err() || terminal {
+            return;
         }
     }
 }

@@ -25,6 +25,10 @@ pub struct SpeculationStats {
     /// Executions that never served: invalidated by a mutation or unused at
     /// turn end.
     pub wasted: usize,
+    /// What the predictor billed across every round — predictor cost, the
+    /// price the hit rate has to earn back. Zero for a replay-oracle run,
+    /// which reads a recording instead of a model.
+    pub predictor_tokens: Usage,
 }
 
 impl SpeculationStats {
@@ -39,7 +43,10 @@ impl SpeculationStats {
         for record in records {
             any = true;
             match record {
-                TraceRecord::Prediction { calls, .. } => stats.proposed += calls.len(),
+                TraceRecord::Prediction { calls, usage, .. } => {
+                    stats.proposed += calls.len();
+                    stats.predictor_tokens.add(*usage);
+                }
                 TraceRecord::SpeculativeExecution { .. } => stats.executed += 1,
                 TraceRecord::Reconciliation { hit, .. } => {
                     if *hit {
@@ -131,6 +138,10 @@ pub struct TaskReport {
     pub tokens: Usage,
     /// Why turns failed, when any did. Empty for a clean baseline.
     pub errors: Vec<String>,
+    /// Why prediction rounds came back short, when any did. A predictor never
+    /// fails a turn, so without these a misconfigured predictor reads as one
+    /// that merely guesses badly.
+    pub predictor_errors: Vec<String>,
     /// Present when the trials speculated.
     pub speculation: Option<SpeculationStats>,
 }
@@ -144,6 +155,7 @@ impl TaskReport {
         let mut by_tool: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         let mut tokens = Usage::default();
         let mut errors = Vec::new();
+        let mut predictor_errors = Vec::new();
 
         for trace in traces {
             for turn in &trace.turns {
@@ -155,6 +167,14 @@ impl TaskReport {
                 }
                 if let Some(error) = &turn.error {
                     errors.push(error.clone());
+                }
+                for record in &turn.speculation {
+                    if let TraceRecord::Prediction {
+                        error: Some(error), ..
+                    } = record
+                    {
+                        predictor_errors.push(error.clone());
+                    }
                 }
             }
             for call in trace.tool_calls() {
@@ -179,6 +199,7 @@ impl TaskReport {
                 .collect(),
             tokens,
             errors,
+            predictor_errors,
             speculation: SpeculationStats::of(traces),
         }
     }
@@ -222,11 +243,51 @@ impl fmt::Display for TaskReport {
                 spec.hit_rate() * 100.0,
                 spec.wasted,
             )?;
+            writeln!(
+                f,
+                "  predictor cost: {} in + {} out tokens",
+                spec.predictor_tokens.input_tokens, spec.predictor_tokens.output_tokens,
+            )?;
         }
         for error in &self.errors {
             writeln!(f, "  error: {error}")?;
         }
+        for error in &self.predictor_errors {
+            writeln!(f, "  predictor error: {error}")?;
+        }
         Ok(())
+    }
+}
+
+/// One strategy against the baseline it has to beat. Net latency change needs
+/// both runs, so it lives here rather than on either report; everything else
+/// the research question asks for — hit rate, predictor cost, wasted work —
+/// is already on the speculated report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comparison {
+    pub baseline: TaskReport,
+    pub speculated: TaskReport,
+}
+
+impl Comparison {
+    /// Median turn wall time saved, negative when speculation cost time.
+    /// Median rather than mean because one long trial should not decide
+    /// whether a strategy paid.
+    pub fn latency_change_ms(&self) -> i64 {
+        self.speculated.turn_ms.median_ms as i64 - self.baseline.turn_ms.median_ms as i64
+    }
+}
+
+impl fmt::Display for Comparison {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.baseline, self.speculated)?;
+        writeln!(
+            f,
+            "  net latency change: median turn {}ms -> {}ms ({:+}ms)",
+            self.baseline.turn_ms.median_ms,
+            self.speculated.turn_ms.median_ms,
+            self.latency_change_ms(),
+        )
     }
 }
 

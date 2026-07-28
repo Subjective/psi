@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use crate::fake::FakeResponse;
 use crate::model::{ModelEvent, ToolCallRequest, TurnRequest};
-use crate::speculation::{PredictionFuture, Predictor};
+use crate::speculation::{Prediction, PredictionFuture, Predictor};
 
 /// Predicts, for each model response, exactly the tool calls that response
 /// will make.
@@ -43,13 +43,22 @@ impl ReplayOracle {
 }
 
 impl Predictor for ReplayOracle {
-    fn predict(&self, _request: &TurnRequest) -> PredictionFuture {
+    /// The prediction budget is ignored: the oracle reads a recording rather
+    /// than a model, so it spends nothing and can never fail. That is what
+    /// makes its run the ceiling — all of speculation's benefit and none of
+    /// its cost.
+    fn predict(&self, _request: &TurnRequest, _budget: u64) -> PredictionFuture {
         let calls = self
             .rounds
             .lock()
             .expect("oracle lock")
             .pop_front()
             .unwrap_or_default();
-        Box::pin(async move { calls })
+        Box::pin(async move {
+            Prediction {
+                calls,
+                ..Prediction::default()
+            }
+        })
     }
 }

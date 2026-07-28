@@ -2,7 +2,7 @@
 //! decoding, and the request bodies built from harness items (Milestone 2).
 
 use psi_core::item::{CompletionStatus, Item, ItemId, ItemPayload, TurnId, WorkspaceRevision};
-use psi_core::model::{ModelEvent, TurnRequest, Usage};
+use psi_core::model::{ModelEvent, Sampling, TurnRequest, Usage};
 use psi_core::responses::{Capabilities, Decoder, SseBuffer, build_request};
 use psi_core::session::SessionId;
 use psi_core::tool::ToolSpec;
@@ -134,6 +134,7 @@ fn request_for(capabilities: Capabilities, items: Vec<Item>) -> Value {
                 description: "read a file".to_string(),
                 parameters: json!({ "type": "object" }),
             }],
+            sampling: Sampling::default(),
         },
     )
 }
