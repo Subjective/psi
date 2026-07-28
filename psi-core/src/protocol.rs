@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::item::{CompletionStatus, Item, ItemId, ItemKind, TurnId};
+use crate::model::Usage;
 use crate::session::{SessionId, SessionMeta, SessionSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,5 +76,10 @@ pub enum EventPayload {
         /// Present when `status` is `Failed`; a turn that fails before any
         /// item starts records its error here alone.
         error: Option<String>,
+        /// Tokens billed across the turn's model responses, summed as they are
+        /// reported. `None` when no response reported any — the fake model
+        /// reports none, and a turn that fails before the first response has
+        /// nothing to report.
+        usage: Option<Usage>,
     },
 }

@@ -68,13 +68,13 @@ item_started | item_delta | item_finished
 turn_finished
 ```
 
-`session_loaded` includes an item-tree snapshot. `item_finished` and `turn_finished` carry a status — `completed | cancelled | failed` — and, when failed, an error message; a turn that fails before any item starts records the error on `turn_finished` alone. Durable items are complete records; streaming deltas exist only in the event protocol.
+`session_loaded` includes an item-tree snapshot. `item_finished` and `turn_finished` carry a status — `completed | cancelled | failed` — and, when failed, an error message; a turn that fails before any item starts records the error on `turn_finished` alone. `turn_finished` also carries the tokens billed across the turn's model responses, which is what the Milestone 5 baselines cost a run by. Durable items are complete records; streaming deltas exist only in the event protocol.
 
 The in-process TUI and future external clients consume the same logical protocol.
 
 ### Model boundary
 
-Psi uses provider-neutral request and event types: `TurnRequest` in, a stream of `ModelEvent` out (response start, text and reasoning deltas, tool-call argument deltas, completed tool calls, usage, completion, errors). The harness never depends on provider wire types; replay-critical provider data passes through as opaque item fields.
+Psi uses provider-neutral request and event types: `TurnRequest` in, a stream of `ModelEvent` out (text and reasoning deltas, reasoning completion, tool-call argument deltas, completed tool calls, usage, completion, errors). The harness never depends on provider wire types; replay-critical provider data passes through as opaque item fields, carried out of the stream by reasoning completion. Dropping the stream cancels the request.
 
 ### Speculative cache
 
