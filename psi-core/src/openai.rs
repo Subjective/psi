@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::model::{ModelBackend, ModelEvent, TurnRequest};
-use crate::responses::{Decoder, SseBuffer, build_request};
+use crate::responses::{Capabilities, Decoder, SseBuffer, build_request};
 
 pub const DEFAULT_INSTRUCTIONS: &str = "\
 You are Psi, a coding agent working in a terminal. You have tools for reading, \
@@ -85,7 +85,12 @@ impl OpenAiBackend {
 impl ModelBackend for OpenAiBackend {
     fn stream_response(&self, request: TurnRequest) -> mpsc::Receiver<ModelEvent> {
         let (events, receiver) = mpsc::channel(64);
-        let body = build_request(&self.config.model, &self.config.instructions, &request);
+        let body = build_request(
+            &self.config.model,
+            &self.config.instructions,
+            Capabilities::OPENAI,
+            &request,
+        );
         let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
         let http = self.http.clone();
         let api_key = self.api_key.clone();

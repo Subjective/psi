@@ -5,7 +5,8 @@
 //!
 //! Requests are stateless. Psi owns history, so nothing is stored provider
 //! side and reasoning replays only through the encrypted reasoning content
-//! carried opaquely on reasoning items.
+//! carried opaquely on reasoning items — and only on targets whose
+//! `Capabilities` say they take it back.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,12 +16,46 @@ use crate::item::{CompletionStatus, Item, ItemPayload};
 use crate::model::{ModelEvent, ToolCallRequest, TurnRequest, Usage};
 use crate::tool::ToolSpec;
 
+/// What a model target's Responses implementation supports. The backends share
+/// this codec but not a capability set, so each one declares the differences
+/// Psi branches on and the codec honors them (docs/design.md, "Model backends:
+/// one Responses codec, explicit capabilities").
+///
+/// Provider-side compaction is the doc's other named capability; it lands here
+/// when Milestone 8 gives it a consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The target returns its reasoning as encrypted content and accepts that
+    /// content back verbatim. When false the request neither asks for
+    /// encrypted reasoning nor replays stored reasoning at all: vLLM raises on
+    /// a replayed reasoning item carrying encrypted content, and provider data
+    /// is opaque to the harness, so the codec cannot tell a blob it would
+    /// accept from one it would reject.
+    pub encrypted_reasoning_replay: bool,
+}
+
+impl Capabilities {
+    pub const OPENAI: Self = Self {
+        encrypted_reasoning_replay: true,
+    };
+    /// vLLM never emits encrypted reasoning and rejects it on input, so a
+    /// session that ran against OpenAI replays here without its reasoning.
+    pub const VLLM: Self = Self {
+        encrypted_reasoning_replay: false,
+    };
+}
+
 /// Builds one streaming `/responses` request body.
-pub fn build_request(model: &str, instructions: &str, request: &TurnRequest) -> Value {
-    json!({
+pub fn build_request(
+    model: &str,
+    instructions: &str,
+    capabilities: Capabilities,
+    request: &TurnRequest,
+) -> Value {
+    let mut body = json!({
         "model": model,
         "instructions": instructions,
-        "input": build_input(&request.items),
+        "input": build_input(&request.items, capabilities),
         "tools": request.tools.iter().map(tool_json).collect::<Vec<_>>(),
         "tool_choice": "auto",
         // The engine runs a response's tool calls one after another, so asking
@@ -29,11 +64,15 @@ pub fn build_request(model: &str, instructions: &str, request: &TurnRequest) -> 
         "reasoning": { "summary": "auto" },
         // Psi owns history; provider-side storage is never authoritative.
         "store": false,
-        // With `store: false` this is the only way a reasoning model sees its
-        // own earlier reasoning again.
-        "include": ["reasoning.encrypted_content"],
         "stream": true
-    })
+    });
+    // With `store: false` this is the only way a reasoning model sees its own
+    // earlier reasoning again. A target that cannot replay it is never asked
+    // for it, so nothing arrives that the next request would have to drop.
+    if capabilities.encrypted_reasoning_replay {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+    body
 }
 
 fn tool_json(spec: &ToolSpec) -> Value {
@@ -45,7 +84,7 @@ fn tool_json(spec: &ToolSpec) -> Value {
     })
 }
 
-fn build_input(items: &[Item]) -> Vec<Value> {
+fn build_input(items: &[Item], capabilities: Capabilities) -> Vec<Value> {
     // A function call the provider cannot pair with its output is rejected on
     // replay, so a call whose arguments never finished streaming is dropped.
     let answered: HashSet<&str> = items
@@ -77,6 +116,7 @@ fn build_input(items: &[Item]) -> Vec<Value> {
             }
             ItemPayload::Reasoning { provider_data, .. } => {
                 if let Some(data) = provider_data
+                    && capabilities.encrypted_reasoning_replay
                     && reasoning_has_output(items, index, &answered)
                 {
                     input.push(data.clone());

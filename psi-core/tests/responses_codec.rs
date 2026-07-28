@@ -3,7 +3,7 @@
 
 use psi_core::item::{CompletionStatus, Item, ItemId, ItemPayload, TurnId, WorkspaceRevision};
 use psi_core::model::{ModelEvent, TurnRequest, Usage};
-use psi_core::responses::{Decoder, SseBuffer, build_request};
+use psi_core::responses::{Capabilities, Decoder, SseBuffer, build_request};
 use psi_core::session::SessionId;
 use psi_core::tool::ToolSpec;
 use serde_json::{Value, json};
@@ -118,9 +118,14 @@ fn tool_result(id: u64, turn: u64, call_id: &str) -> Item {
 }
 
 fn request(items: Vec<Item>) -> Value {
+    request_for(Capabilities::OPENAI, items)
+}
+
+fn request_for(capabilities: Capabilities, items: Vec<Item>) -> Value {
     build_request(
         "test-model",
         "be helpful",
+        capabilities,
         &TurnRequest {
             session_id: SessionId("s0".to_string()),
             items,
@@ -382,6 +387,55 @@ fn a_cancelled_call_still_answers_the_model() {
             "output": "call cancelled before it ran",
         })
     );
+}
+
+/// A target that cannot replay encrypted reasoning is neither asked for it nor
+/// sent it back. vLLM raises "Encrypted content is not supported." on a
+/// replayed reasoning item that carries any, and provider data is opaque, so
+/// the codec drops every reasoning item rather than inspect the blobs.
+#[test]
+fn a_target_without_encrypted_reasoning_neither_asks_for_it_nor_replays_it() {
+    let items = vec![
+        item(
+            0,
+            0,
+            ItemPayload::UserMessage {
+                text: "read it".to_string(),
+            },
+        ),
+        item(
+            1,
+            0,
+            ItemPayload::Reasoning {
+                text: "Check the file.".to_string(),
+                provider_data: Some(json!({ "type": "reasoning", "encrypted_content": "enc" })),
+            },
+        ),
+        tool_call(2, 0, "call_1"),
+        tool_result(3, 0, "call_1"),
+    ];
+
+    let body = request_for(Capabilities::VLLM, items.clone());
+    assert!(body.get("include").is_none(), "{body}");
+    assert_eq!(
+        body["input"],
+        json!([
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "read it" }] },
+            {
+                "type": "function_call",
+                "name": "read_file",
+                "call_id": "call_1",
+                "arguments": "{\"path\":\"README.md\"}",
+            },
+            { "type": "function_call_output", "call_id": "call_1", "output": "# fixture" },
+        ])
+    );
+
+    // Everything else about the request is the one shared codec's output.
+    let openai = request_for(Capabilities::OPENAI, items);
+    assert_eq!(openai["store"], false);
+    assert_eq!(openai["tools"], body["tools"]);
+    assert_eq!(openai["input"].as_array().unwrap().len(), 4);
 }
 
 #[test]

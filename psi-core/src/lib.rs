@@ -18,5 +18,6 @@ pub mod store;
 pub mod tool;
 pub mod tools;
 pub mod trace;
+pub mod vllm;
 
 pub use engine::{Harness, HarnessConfig};
