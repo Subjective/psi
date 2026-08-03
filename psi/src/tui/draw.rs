@@ -260,6 +260,11 @@ fn wrap_composer(
         }
         if number == cursor.0 {
             position = (first + cursor.1 / width, cursor.1 % width);
+            // The insert cursor sits one past the text, so a line exactly
+            // filling its rows puts it on a row that does not exist yet.
+            if position.0 == rows.len() {
+                rows.push(String::new());
+            }
         }
     }
     if rows.is_empty() {
@@ -271,6 +276,10 @@ fn wrap_composer(
 /// The `height` rows worth showing: the end of a stream, or the selected row of
 /// a list that is taller than the space it has.
 fn window(rows: &[(Tone, String)], height: usize) -> Vec<(Tone, String)> {
+    // A full-height composer leaves the live region no rows at all.
+    if height == 0 {
+        return Vec::new();
+    }
     if rows.len() <= height {
         return rows.to_vec();
     }
