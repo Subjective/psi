@@ -117,6 +117,11 @@ fn search(root: &Path, path: &Path, pattern: &Regex, matches: &mut Vec<String>) 
             if SKIPPED_DIRS.contains(&name.to_string_lossy().as_ref()) {
                 continue;
             }
+            // A symlink can point outside the workspace root or back up the
+            // tree; the walk stays on real paths.
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
             search(root, &entry.path(), pattern, matches);
         }
         return;

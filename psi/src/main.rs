@@ -90,7 +90,9 @@ async fn render(events: &mut tokio::sync::mpsc::Receiver<psi_core::protocol::Eve
                     streaming,
                     Some(ItemKind::AssistantMessage) | Some(ItemKind::Reasoning)
                 ) {
+                    // Deltas rarely end in a newline; flush or nothing streams.
                     print!("{delta}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             }
             EventPayload::ItemFinished { item } => match item.payload {

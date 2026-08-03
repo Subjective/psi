@@ -192,27 +192,23 @@ impl Decoder {
             }
             "response.output_item.done" => self.finish_item(event.get("item")),
             "response.completed" => {
-                let mut events = Vec::new();
-                if let Some(usage) = event.get("response").and_then(|r| r.get("usage")) {
-                    events.push(ModelEvent::Usage {
-                        usage: Usage {
-                            input_tokens: number(usage, "input_tokens"),
-                            output_tokens: number(usage, "output_tokens"),
-                        },
-                    });
-                }
+                let mut events: Vec<ModelEvent> = usage_of(event).into_iter().collect();
                 events.push(ModelEvent::Completed);
                 events
             }
+            // Failed and incomplete responses are still billed, so their usage
+            // is kept ahead of the terminal error.
             "response.failed" => {
                 let message = event
                     .get("response")
                     .and_then(|response| response.get("error"))
                     .and_then(|error| string(error, "message"))
                     .unwrap_or("response failed");
-                vec![ModelEvent::Error {
+                let mut events: Vec<ModelEvent> = usage_of(event).into_iter().collect();
+                events.push(ModelEvent::Error {
                     message: message.to_string(),
-                }]
+                });
+                events
             }
             "response.incomplete" => {
                 let reason = event
@@ -220,9 +216,11 @@ impl Decoder {
                     .and_then(|response| response.get("incomplete_details"))
                     .and_then(|details| string(details, "reason"))
                     .unwrap_or("unknown");
-                vec![ModelEvent::Error {
+                let mut events: Vec<ModelEvent> = usage_of(event).into_iter().collect();
+                events.push(ModelEvent::Error {
                     message: format!("response incomplete: {reason}"),
-                }]
+                });
+                events
             }
             "error" => vec![ModelEvent::Error {
                 message: string(event, "message")
@@ -303,6 +301,17 @@ impl Decoder {
             _ => Vec::new(),
         }
     }
+}
+
+/// The billed tokens of a terminal stream event, when it carries any.
+fn usage_of(event: &Value) -> Option<ModelEvent> {
+    let usage = event.get("response")?.get("usage")?;
+    Some(ModelEvent::Usage {
+        usage: Usage {
+            input_tokens: number(usage, "input_tokens"),
+            output_tokens: number(usage, "output_tokens"),
+        },
+    })
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
