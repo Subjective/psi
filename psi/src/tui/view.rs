@@ -15,9 +15,8 @@
 use std::collections::HashMap;
 
 use psi_core::item::{CompletionStatus, Item, ItemId, ItemKind, ItemPayload};
-use psi_core::model::Usage;
 use psi_core::protocol::EventPayload;
-use psi_core::session::SessionSnapshot;
+use psi_core::session::{SessionId, SessionSnapshot};
 
 /// What a line is, so the drawing layer can style it. Tones exist because
 /// something renders them differently; there is no tone without a colour.
@@ -31,11 +30,13 @@ pub enum Tone {
     ToolOutput,
     DiffAdded,
     DiffRemoved,
+    /// A line inside a fenced code block in assistant text.
+    Code,
     /// Psi speaking about itself: branch moves, cancellation, prompts.
     Notice,
     Error,
-    /// The selected row of the branch list; the drawing layer also scrolls the
-    /// list to keep it visible.
+    /// The selected row of a picker; the drawing layer also scrolls the list
+    /// to keep it visible.
     Selected,
 }
 
@@ -63,6 +64,13 @@ impl DisplayLine {
 /// past the user.
 const MAX_BLOCK_LINES: usize = 24;
 
+/// A rendered tool call waiting for its result, which is what tells it how
+/// long it took.
+struct PendingCall {
+    call_id: String,
+    lines: Vec<DisplayLine>,
+}
+
 /// An item that has started but not finished: `item_started` and its deltas
 /// have arrived, the durable record has not.
 struct Open {
@@ -79,13 +87,20 @@ pub struct View {
     index: HashMap<ItemId, usize>,
     head: Option<ItemId>,
     open: Option<Open>,
+    /// Tool calls whose lines are held until their results arrive, oldest
+    /// first. A response can make several calls before any of them runs, so
+    /// the call id is what pairs a call with the result that times it.
+    pending_calls: Vec<PendingCall>,
     /// Lines that have become final, waiting to be handed to the terminal.
     scrollback: Vec<DisplayLine>,
     /// Whether anything has been emitted yet, so blocks are separated by a
     /// blank line without one opening the session.
     emitted: bool,
+    /// Whether the assistant text being rendered is inside a ``` fence. It
+    /// spans the streaming flush and the item's final render, which are two
+    /// halves of one message.
+    fenced: bool,
     running: bool,
-    usage: Option<Usage>,
 }
 
 impl View {
@@ -95,19 +110,16 @@ impl View {
             index: HashMap::new(),
             head: None,
             open: None,
+            pending_calls: Vec::new(),
             scrollback: Vec::new(),
             emitted: false,
+            fenced: false,
             running: false,
-            usage: None,
         }
     }
 
     pub fn running(&self) -> bool {
         self.running
-    }
-
-    pub fn usage(&self) -> Option<Usage> {
-        self.usage
     }
 
     pub fn head(&self) -> Option<ItemId> {
@@ -160,6 +172,12 @@ impl View {
         std::mem::take(&mut self.scrollback)
     }
 
+    /// Psi answering the user directly rather than reporting an event: what a
+    /// slash command has to say for itself.
+    pub fn notice(&mut self, text: impl Into<String>) {
+        self.push(DisplayLine::new(Tone::Notice, text));
+    }
+
     /// The lines that are still changing: the tail of whatever is streaming.
     /// Redrawn every frame, never written to the scrollback until it is final.
     pub fn live(&self) -> Vec<DisplayLine> {
@@ -183,13 +201,13 @@ impl View {
                 Tone::Tool,
                 format!("• {}", open.text.trim()),
             )],
-            ItemKind::ToolResult => {
-                let tool = match self.items.last().map(|item| &item.payload) {
-                    Some(ItemPayload::ToolCall { tool, .. }) => tool.as_str(),
-                    _ => "tool",
-                };
-                vec![DisplayLine::new(Tone::Notice, format!("… running {tool}"))]
-            }
+            // Calls run in the order they were made, so the oldest one still
+            // held is the one running. It is held back until it can carry its
+            // duration, which makes it what the viewport shows meanwhile.
+            ItemKind::ToolResult => match self.pending_calls.first() {
+                Some(pending) => pending.lines.clone(),
+                None => vec![DisplayLine::new(Tone::Notice, "… working")],
+            },
             ItemKind::UserMessage => Vec::new(),
         }
     }
@@ -197,23 +215,22 @@ impl View {
     /// The branch picker: the past messages of the active path, plus where that
     /// path sits among the tree's branches.
     pub fn branch_lines(&self, selected: usize, leaf: usize, leaves: usize) -> Vec<DisplayLine> {
-        let mut lines = vec![DisplayLine::new(
-            Tone::Notice,
-            format!("branch {}/{leaves} — edit a past message to fork", leaf + 1),
-        )];
-        for (position, id) in self.user_messages().into_iter().enumerate() {
-            let text = match self.item(id).map(|item| &item.payload) {
+        let rows = self
+            .user_messages()
+            .into_iter()
+            .map(|id| match self.item(id).map(|item| &item.payload) {
                 Some(ItemPayload::UserMessage { text }) => text.replace('\n', " "),
                 _ => String::new(),
-            };
-            let (tone, marker) = if position == selected {
-                (Tone::Selected, ">")
-            } else {
-                (Tone::User, " ")
-            };
-            lines.push(DisplayLine::new(tone, format!("{marker} {text}")));
-        }
-        lines
+            })
+            .collect();
+        picker(
+            format!(
+                "branch {}/{leaves} — k/j select · enter edit · tab branch · esc close",
+                leaf + 1
+            ),
+            rows,
+            selected,
+        )
     }
 
     pub fn apply(&mut self, payload: &EventPayload) {
@@ -237,17 +254,12 @@ impl View {
                 self.flush_streamed_lines();
             }
             EventPayload::ItemFinished { item } => self.finish(item),
-            EventPayload::TurnFinished {
-                status,
-                error,
-                usage,
-                ..
-            } => {
+            EventPayload::TurnFinished { status, error, .. } => {
                 self.running = false;
                 self.open = None;
-                if usage.is_some() {
-                    self.usage = *usage;
-                }
+                // A turn that ended before a call's result still owes the call
+                // its line.
+                self.flush_pending();
                 match status {
                     CompletionStatus::Cancelled => {
                         self.push(DisplayLine::new(Tone::Notice, "psi: turn cancelled"));
@@ -259,8 +271,23 @@ impl View {
                     CompletionStatus::Completed => {}
                 }
             }
-            EventPayload::SessionCreated { .. } | EventPayload::SessionsListed { .. } => {}
+            EventPayload::SessionCreated { meta } => self.reset(&meta.id),
+            EventPayload::SessionsListed { .. } => {}
         }
+    }
+
+    /// Starts on a fresh session: the tree the client mirrors is another
+    /// session's now, and the id is said out loud because it is the only place
+    /// the TUI names it.
+    fn reset(&mut self, id: &SessionId) {
+        self.items.clear();
+        self.index.clear();
+        self.head = None;
+        self.open = None;
+        self.pending_calls.clear();
+        self.running = false;
+        self.separate();
+        self.notice(format!("psi: new session {}", id.0));
     }
 
     /// Moves head client-side after the same `set_head` was sent to the
@@ -277,6 +304,7 @@ impl View {
         for item in &items {
             self.render(item, 0);
         }
+        self.flush_pending();
     }
 
     fn load(&mut self, snapshot: &SessionSnapshot) {
@@ -299,6 +327,7 @@ impl View {
         for item in self.path().into_iter().cloned().collect::<Vec<_>>() {
             self.render(&item, 0);
         }
+        self.flush_pending();
     }
 
     /// Hands complete lines of a streaming item to the scrollback as they
@@ -325,9 +354,10 @@ impl View {
         }
         if first {
             self.separate();
+            self.fenced = false;
         }
         for line in lines {
-            self.push(DisplayLine::new(tone, line));
+            self.push_text(&line, tone);
         }
     }
 
@@ -350,8 +380,11 @@ impl View {
         match &item.payload {
             ItemPayload::UserMessage { text } => {
                 self.separate();
-                for line in text.lines() {
-                    self.push(DisplayLine::new(Tone::User, format!("> {line}")));
+                // The composer's own gutters, so the echo lands on the rows
+                // where the prompt was typed.
+                for (number, line) in text.lines().enumerate() {
+                    let gutter = if number == 0 { "> " } else { "  " };
+                    self.push(DisplayLine::new(Tone::User, format!("{gutter}{line}")));
                 }
             }
             ItemPayload::AssistantMessage { text } => {
@@ -361,9 +394,11 @@ impl View {
                 self.text_block(text, skip, Tone::Reasoning);
             }
             ItemPayload::ToolCall {
-                tool, arguments, ..
+                tool,
+                call_id,
+                arguments,
+                ..
             } => {
-                self.separate();
                 let mut lines = Vec::new();
                 // Diffs render from the `apply_patch` call's arguments; they are
                 // not items of their own (docs/design.md, "Data Model").
@@ -377,11 +412,18 @@ impl View {
                         format!("• {tool} {arguments}"),
                     ));
                 }
-                self.push_capped(lines);
+                self.pending_calls.push(PendingCall {
+                    call_id: call_id.clone(),
+                    lines,
+                });
             }
             ItemPayload::ToolResult {
-                content, truncated, ..
+                call_id,
+                content,
+                truncated,
+                duration_ms,
             } => {
+                self.flush_call(call_id, *duration_ms);
                 let tone = if item.status == CompletionStatus::Failed {
                     Tone::Error
                 } else {
@@ -402,10 +444,23 @@ impl View {
         if item.payload.kind() != ItemKind::ToolResult
             && let Some(error) = &item.error
         {
-            self.push(DisplayLine::new(Tone::Error, format!("  {error}")));
+            self.annotate(item, DisplayLine::new(Tone::Error, format!("  {error}")));
         }
         if item.status == CompletionStatus::Cancelled {
-            self.push(DisplayLine::new(Tone::Notice, "  [cancelled]"));
+            self.annotate(item, DisplayLine::new(Tone::Notice, "  [cancelled]"));
+        }
+    }
+
+    /// A line about the item just rendered. A tool call's own lines are still
+    /// held, so its error joins them rather than printing above them.
+    fn annotate(&mut self, item: &Item, line: DisplayLine) {
+        match (&item.payload, self.pending_calls.last_mut()) {
+            (ItemPayload::ToolCall { call_id, .. }, Some(pending))
+                if pending.call_id == *call_id =>
+            {
+                pending.lines.push(line)
+            }
+            _ => self.push(line),
         }
     }
 
@@ -422,9 +477,59 @@ impl View {
         }
         if skip == 0 {
             self.separate();
+            self.fenced = false;
         }
         for line in lines {
+            self.push_text(line, tone);
+        }
+    }
+
+    /// One line of a text block. A ``` line opens or closes a fenced block and
+    /// is not itself printed; what it fences is indented and dimmed. This is
+    /// the whole of Psi's markdown: a fence is the one piece of it a terminal
+    /// reader needs, because code inside prose is what the eye is hunting for.
+    fn push_text(&mut self, line: &str, tone: Tone) {
+        if tone != Tone::Assistant {
             self.push(DisplayLine::new(tone, line));
+            return;
+        }
+        if line.trim_start().starts_with("```") {
+            self.fenced = !self.fenced;
+            return;
+        }
+        match self.fenced {
+            true => self.push(DisplayLine::new(Tone::Code, format!("  {line}"))),
+            false => self.push(DisplayLine::new(tone, line)),
+        }
+    }
+
+    /// Pushes the held call this result belongs to, with the time it took
+    /// written onto the call itself. Terminal scrollback only grows, so a
+    /// duration reaches the line that names its call only by waiting for it.
+    fn flush_call(&mut self, call_id: &str, duration_ms: u64) {
+        let Some(at) = self
+            .pending_calls
+            .iter()
+            .position(|pending| pending.call_id == call_id)
+        else {
+            return;
+        };
+        let mut pending = self.pending_calls.remove(at);
+        if let Some(first) = pending.lines.first_mut() {
+            first
+                .text
+                .push_str(&format!(" · {}", duration(duration_ms)));
+        }
+        self.separate();
+        self.push_capped(pending.lines);
+    }
+
+    /// Pushes every call still waiting on a result, timeless: nothing is going
+    /// to arrive to time them now.
+    fn flush_pending(&mut self) {
+        for pending in std::mem::take(&mut self.pending_calls) {
+            self.separate();
+            self.push_capped(pending.lines);
         }
     }
 
@@ -452,6 +557,42 @@ impl View {
     fn push(&mut self, line: DisplayLine) {
         self.emitted = true;
         self.scrollback.push(line);
+    }
+}
+
+/// A list over the composer: a header naming its keys, then one row per
+/// entry with the selected one marked. Branch mode, `/resume` and the `@`
+/// picker are the same widget over different rows.
+pub fn picker(header: String, rows: Vec<String>, selected: usize) -> Vec<DisplayLine> {
+    let mut lines = vec![DisplayLine::new(Tone::Notice, header)];
+    for (position, row) in rows.into_iter().enumerate() {
+        let (tone, marker) = if position == selected {
+            (Tone::Selected, ">")
+        } else {
+            (Tone::User, " ")
+        };
+        lines.push(DisplayLine::new(tone, format!("{marker} {row}")));
+    }
+    lines
+}
+
+/// How long ago something happened, coarsely. A session list is chosen from by
+/// recency, so the row needs an order of magnitude, not a timestamp.
+pub fn age(created_at_ms: u64, now_ms: u64) -> String {
+    match now_ms.saturating_sub(created_at_ms) / 1000 {
+        seconds if seconds < 60 => "just now".to_string(),
+        seconds if seconds < 3600 => format!("{}m ago", seconds / 60),
+        seconds if seconds < 86_400 => format!("{}h ago", seconds / 3600),
+        seconds => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+/// How long a tool call took. Sub-second calls are the common case; a call
+/// that ran for minutes reads as a number a person can hold.
+fn duration(ms: u64) -> String {
+    match ms {
+        ms if ms < 1000 => format!("{ms}ms"),
+        ms => format!("{:.1}s", ms as f64 / 1000.0),
     }
 }
 
@@ -569,16 +710,41 @@ mod tests {
         )
     }
 
-    fn call(id: u64, parent: Option<u64>, tool: &str, arguments: serde_json::Value) -> Item {
+    fn call(
+        id: u64,
+        parent: Option<u64>,
+        tool: &str,
+        arguments: serde_json::Value,
+        call_id: &str,
+    ) -> Item {
         item(
             id,
             parent,
             ItemPayload::ToolCall {
                 tool: tool.to_string(),
-                call_id: "call-1".to_string(),
+                call_id: call_id.to_string(),
                 arguments,
                 cwd: PathBuf::from("/workspace"),
                 revision: WorkspaceRevision(0),
+            },
+        )
+    }
+
+    fn result(
+        id: u64,
+        parent: Option<u64>,
+        content: &str,
+        duration_ms: u64,
+        call_id: &str,
+    ) -> Item {
+        item(
+            id,
+            parent,
+            ItemPayload::ToolResult {
+                call_id: call_id.to_string(),
+                content: content.to_string(),
+                duration_ms,
+                truncated: false,
             },
         )
     }
@@ -681,6 +847,25 @@ mod tests {
     }
 
     #[test]
+    fn a_fenced_block_is_indented_and_its_fences_are_not_printed() {
+        let mut view = View::new();
+        let text = "try this:\n```sh\necho 42\n```\nthat is all.";
+        view.apply(&started(0, ItemKind::AssistantMessage));
+        // The fence spans the streaming flush and the final render, so it is
+        // fed in two pieces on purpose.
+        view.apply(&delta(0, "try this:\n```sh\necho 42\n"));
+        view.apply(&finished(assistant(0, None, text)));
+        assert_eq!(
+            drain(&mut view),
+            [
+                (Tone::Assistant, "try this:".to_string()),
+                (Tone::Code, "  echo 42".to_string()),
+                (Tone::Assistant, "that is all.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn reasoning_and_assistant_text_carry_different_tones() {
         let mut view = View::new();
         view.apply(&started(0, ItemKind::Reasoning));
@@ -708,22 +893,24 @@ mod tests {
             None,
             "read_file",
             json!({ "path": "src/lib.sh" }),
+            "call-1",
         )));
         view.apply(&started(1, ItemKind::ToolResult));
-        // The result item carries no tool name; the call before it does.
+        // The call is held back until it can carry its duration, so it is what
+        // the viewport shows while the tool runs.
         assert_eq!(
             view.live(),
-            [DisplayLine::new(Tone::Notice, "… running read_file")]
+            [DisplayLine::new(
+                Tone::Tool,
+                "• read_file {\"path\":\"src/lib.sh\"}"
+            )]
         );
-        view.apply(&finished(item(
+        view.apply(&finished(result(
             1,
             Some(0),
-            ItemPayload::ToolResult {
-                call_id: "call-1".to_string(),
-                content: "answer() {\n  echo 41\n}".to_string(),
-                duration_ms: 3,
-                truncated: false,
-            },
+            "answer() {\n  echo 41\n}",
+            3,
+            "call-1",
         )));
 
         assert_eq!(
@@ -731,7 +918,7 @@ mod tests {
             [
                 (
                     Tone::Tool,
-                    "• read_file {\"path\":\"src/lib.sh\"}".to_string()
+                    "• read_file {\"path\":\"src/lib.sh\"} · 3ms".to_string()
                 ),
                 (Tone::ToolOutput, "  answer() {".to_string()),
                 (Tone::ToolOutput, "    echo 41".to_string()),
@@ -740,22 +927,53 @@ mod tests {
         );
     }
 
+    /// A response can make several calls before any of them runs, so the
+    /// calls arrive together and the results follow one at a time. Each call
+    /// waits for the result that carries its own id.
+    #[test]
+    fn parallel_calls_pair_with_their_own_results() {
+        let mut view = View::new();
+        view.apply(&finished(call(
+            0,
+            None,
+            "read_file",
+            json!({ "path": "a" }),
+            "call-a",
+        )));
+        view.apply(&finished(call(
+            1,
+            Some(0),
+            "read_file",
+            json!({ "path": "b" }),
+            "call-b",
+        )));
+        view.apply(&finished(result(2, Some(1), "contents of a", 5, "call-a")));
+        view.apply(&finished(result(3, Some(2), "contents of b", 9, "call-b")));
+        assert_eq!(
+            texts(&mut view),
+            [
+                "• read_file {\"path\":\"a\"} · 5ms",
+                "  contents of a",
+                "",
+                "• read_file {\"path\":\"b\"} · 9ms",
+                "  contents of b",
+            ]
+        );
+    }
+
     #[test]
     fn a_failed_tool_result_is_toned_as_an_error() {
         let mut view = View::new();
-        let mut result = item(
+        let mut failed = result(
             0,
             None,
-            ItemPayload::ToolResult {
-                call_id: "call-1".to_string(),
-                content: "read_file ../secret: escapes the workspace root".to_string(),
-                duration_ms: 1,
-                truncated: false,
-            },
+            "read_file ../secret: escapes the workspace root",
+            1,
+            "call-1",
         );
-        result.status = CompletionStatus::Failed;
-        result.error = Some("read_file ../secret: escapes the workspace root".to_string());
-        view.apply(&finished(result));
+        failed.status = CompletionStatus::Failed;
+        failed.error = Some("read_file ../secret: escapes the workspace root".to_string());
+        view.apply(&finished(failed));
         assert_eq!(
             drain(&mut view),
             [(
@@ -777,13 +995,23 @@ mod tests {
                 "old_text": "answer() {\n  echo 41\n}",
                 "new_text": "answer() {\n  echo 42\n}",
             }),
+            "call-1",
+        )));
+        // A call that ran for more than a second reads in seconds.
+        view.apply(&finished(result(
+            1,
+            Some(0),
+            "updated src/lib.sh",
+            1240,
+            "call-1",
         )));
         assert_eq!(
             drain(&mut view),
             [
-                (Tone::Tool, "• apply_patch src/lib.sh".to_string()),
+                (Tone::Tool, "• apply_patch src/lib.sh · 1.2s".to_string()),
                 (Tone::DiffRemoved, "  -  echo 41".to_string()),
                 (Tone::DiffAdded, "  +  echo 42".to_string()),
+                (Tone::ToolOutput, "  updated src/lib.sh".to_string()),
             ]
         );
     }
@@ -797,13 +1025,22 @@ mod tests {
             None,
             "apply_patch",
             json!({ "path": "new.txt", "old_text": "", "new_text": "one\ntwo\n" }),
+            "call-1",
+        )));
+        view.apply(&finished(result(
+            1,
+            Some(0),
+            "created new.txt",
+            4,
+            "call-1",
         )));
         assert_eq!(
             drain(&mut view),
             [
-                (Tone::Tool, "• apply_patch new.txt".to_string()),
+                (Tone::Tool, "• apply_patch new.txt · 4ms".to_string()),
                 (Tone::DiffAdded, "  +one".to_string()),
                 (Tone::DiffAdded, "  +two".to_string()),
+                (Tone::ToolOutput, "  created new.txt".to_string()),
             ]
         );
     }
@@ -811,10 +1048,18 @@ mod tests {
     #[test]
     fn a_call_whose_arguments_never_finished_still_renders() {
         let mut view = View::new();
-        let mut broken = call(0, None, "apply_patch", serde_json::Value::Null);
+        let mut broken = call(0, None, "apply_patch", serde_json::Value::Null, "call-1");
         broken.status = CompletionStatus::Failed;
         broken.error = Some("the response completed before the arguments did".to_string());
         view.apply(&finished(broken));
+        // The call never runs, so no result ever carries it out; the turn's end
+        // is what flushes it.
+        view.apply(&EventPayload::TurnFinished {
+            turn_id: TurnId(0),
+            status: CompletionStatus::Completed,
+            error: None,
+            usage: None,
+        });
         assert_eq!(
             drain(&mut view),
             [
@@ -834,16 +1079,7 @@ mod tests {
             .map(|n| format!("line {n}\n"))
             .collect::<Vec<_>>()
             .concat();
-        view.apply(&finished(item(
-            0,
-            None,
-            ItemPayload::ToolResult {
-                call_id: "call-1".to_string(),
-                content,
-                duration_ms: 1,
-                truncated: false,
-            },
-        )));
+        view.apply(&finished(result(0, None, &content, 1, "call-1")));
         let lines = texts(&mut view);
         assert_eq!(lines.len(), MAX_BLOCK_LINES + 1);
         assert_eq!(lines[MAX_BLOCK_LINES], "  … 16 more lines");
@@ -958,11 +1194,41 @@ mod tests {
                 .map(|line| (line.tone, line.text.as_str()))
                 .collect::<Vec<_>>(),
             [
-                (Tone::Notice, "branch 2/2 — edit a past message to fork"),
+                (
+                    Tone::Notice,
+                    "branch 2/2 — k/j select · enter edit · tab branch · esc close"
+                ),
                 (Tone::User, "  first"),
                 (Tone::Selected, "> second, revised"),
             ]
         );
+    }
+
+    #[test]
+    fn a_sessions_age_is_coarse() {
+        let hour = 3_600_000;
+        assert_eq!(age(hour, hour + 1_000), "just now");
+        assert_eq!(age(hour, hour + 90_000), "1m ago");
+        assert_eq!(age(hour, hour + 2 * hour), "2h ago");
+        assert_eq!(age(hour, hour + 72 * hour), "3d ago");
+        // A clock that went backwards is not an error worth having.
+        assert_eq!(age(hour, 0), "just now");
+    }
+
+    #[test]
+    fn a_created_session_clears_the_tree_and_names_itself() {
+        let mut view = forked();
+        drain(&mut view);
+        view.apply(&EventPayload::SessionCreated {
+            meta: SessionMeta {
+                id: SessionId("s2".to_string()),
+                created_at_ms: 0,
+            },
+        });
+        assert_eq!(texts(&mut view), ["", "psi: new session s2"]);
+        assert!(view.leaves().is_empty());
+        assert_eq!(view.head(), None);
+        assert!(view.user_messages().is_empty());
     }
 
     #[test]

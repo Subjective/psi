@@ -10,6 +10,11 @@
 //! Positions are character offsets into the rope. In normal mode the cursor
 //! rests *on* a character, so it stops one short of the line break; in insert
 //! mode it may sit past the last character of a line.
+//!
+//! Insert mode also carries the readline bindings a terminal prompt is expected
+//! to have — Ctrl-A/E, Ctrl-U/K/W. They are not Vim, and they are not a second
+//! grammar either: each one is a motion the grammar already computes, applied
+//! to the line the cursor is on.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ropey::Rope;
@@ -83,6 +88,24 @@ enum Action {
     DeleteChar,
 }
 
+/// What an insert-mode control key does with a motion the grammar already
+/// computes: go there, or take everything between here and there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readline {
+    Move(Motion),
+    Delete(Motion),
+}
+
+/// `Ctrl-<key>` in insert mode. Ctrl-W deletes by the same word rule `b` moves
+/// by, so a prompt and a Vim motion never disagree about where a word starts.
+const READLINE: &[(char, Readline)] = &[
+    ('a', Readline::Move(Motion::LineStart)),
+    ('e', Readline::Move(Motion::LineEnd)),
+    ('u', Readline::Delete(Motion::LineStart)),
+    ('k', Readline::Delete(Motion::LineEnd)),
+    ('w', Readline::Delete(Motion::WordBackward)),
+];
+
 /// Normal-mode keys that act on their own, taking only a count.
 const ACTIONS: &[(char, Action)] = &[
     ('i', Action::InsertBefore),
@@ -142,15 +165,16 @@ pub struct Composer {
 
 impl Composer {
     /// Starts in insert mode: the first thing a new session wants is a typed
-    /// prompt, not a motion.
-    pub fn new() -> Self {
+    /// prompt, not a motion. `history` is the prompts persisted by earlier
+    /// runs, oldest first; recall walks them and this run's as one list.
+    pub fn new(history: Vec<String>) -> Self {
         Self {
             text: Rope::new(),
             cursor: 0,
             mode: Mode::Insert,
             column_intent: 0,
             pending: Pending::default(),
-            history: Vec::new(),
+            history,
             recall: None,
             stashed: String::new(),
         }
@@ -178,6 +202,31 @@ impl Composer {
     pub fn cursor(&self) -> (usize, usize) {
         let line = self.text.char_to_line(self.cursor);
         (line, self.cursor - self.text.line_to_char(line))
+    }
+
+    /// The cursor as a character offset, which is how the file picker
+    /// remembers where its `@` was.
+    pub fn offset(&self) -> usize {
+        self.cursor
+    }
+
+    /// The characters between `from` and the cursor. `None` once the cursor has
+    /// moved back past `from`, which is how the file picker learns its `@` was
+    /// deleted or left behind.
+    pub fn text_after(&self, from: usize) -> Option<String> {
+        if self.cursor < from || from > self.text.len_chars() {
+            return None;
+        }
+        Some(self.text.slice(from..self.cursor).to_string())
+    }
+
+    /// Replaces the characters between `from` and the cursor — the file picker
+    /// swapping its `@query` for the path it selected.
+    pub fn replace_range(&mut self, from: usize, text: &str) {
+        let from = from.min(self.cursor);
+        self.text.remove(from..self.cursor);
+        self.cursor = from;
+        self.insert_str(text);
     }
 
     pub fn is_blank(&self) -> bool {
@@ -270,7 +319,16 @@ impl Composer {
             KeyCode::Enter if alt => self.insert_str("\n"),
             KeyCode::Char('j') if control => self.insert_str("\n"),
             KeyCode::Enter => return Outcome::Submit,
-            KeyCode::Char(c) if !control && !alt => self.insert_str(&c.to_string()),
+            KeyCode::Char(c) if control => {
+                if let Some(action) = READLINE
+                    .iter()
+                    .find(|(key, _)| *key == c)
+                    .map(|(_, action)| *action)
+                {
+                    self.readline(action);
+                }
+            }
+            KeyCode::Char(c) if !alt => self.insert_str(&c.to_string()),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
@@ -360,6 +418,31 @@ impl Composer {
         // A key the grammar does not name abandons what was typed, rather than
         // leaving a count to attach itself to the next one.
         self.pending = Pending::default();
+    }
+
+    fn readline(&mut self, action: Readline) {
+        match action {
+            Readline::Move(motion) => self.cursor = self.readline_target(motion),
+            Readline::Delete(motion) => {
+                let target = self.readline_target(motion);
+                let (start, end) = (self.cursor.min(target), self.cursor.max(target));
+                if end > start {
+                    self.text.remove(start..end);
+                }
+                self.cursor = start;
+            }
+        }
+        self.clamp();
+        self.column_intent = self.cursor().1;
+    }
+
+    /// Where a readline binding aims. Insert mode's end of line is past the
+    /// last character, one further than `$` goes.
+    fn readline_target(&self, motion: Motion) -> usize {
+        match motion {
+            Motion::LineEnd => self.line_bounds_at().1,
+            other => self.target(other, 1),
+        }
     }
 
     fn act(&mut self, action: Action, count: usize) {
@@ -591,8 +674,16 @@ impl Composer {
 mod tests {
     use super::*;
 
+    fn fresh() -> Composer {
+        Composer::new(Vec::new())
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     /// Types a run of characters as individual key presses.
@@ -619,7 +710,7 @@ mod tests {
 
     #[test]
     fn insert_mode_types_and_backspaces() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         typed(&mut composer, "hello");
         composer.key(key(KeyCode::Backspace));
         assert_eq!(state(&composer), ("hell".into(), (0, 4), Mode::Insert));
@@ -627,7 +718,7 @@ mod tests {
 
     #[test]
     fn escape_leaves_insert_mode_on_the_last_character() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         typed(&mut composer, "hi");
         escape(&mut composer);
         assert_eq!(state(&composer), ("hi".into(), (0, 1), Mode::Normal));
@@ -635,7 +726,7 @@ mod tests {
 
     #[test]
     fn enter_asks_to_submit_from_both_modes() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         typed(&mut composer, "ask");
         assert_eq!(composer.key(key(KeyCode::Enter)), Outcome::Submit);
         escape(&mut composer);
@@ -644,9 +735,9 @@ mod tests {
 
     #[test]
     fn ctrl_j_and_alt_enter_insert_newlines() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         typed(&mut composer, "one");
-        composer.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        composer.key(ctrl('j'));
         typed(&mut composer, "two");
         composer.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         typed(&mut composer, "three");
@@ -657,21 +748,75 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_a_and_ctrl_e_go_to_the_ends_of_the_cursors_line() {
+        let mut composer = fresh();
+        composer.paste("first\nsecond");
+        composer.key(ctrl('a'));
+        assert_eq!(
+            state(&composer),
+            ("first\nsecond".into(), (1, 0), Mode::Insert)
+        );
+        composer.key(ctrl('e'));
+        // Insert mode's end of line is past the last character, not on it.
+        assert_eq!(composer.cursor(), (1, 6));
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_k_delete_to_the_ends_of_the_cursors_line() {
+        let mut composer = fresh();
+        composer.paste("keep\nthrow away this");
+        composer.key(ctrl('a'));
+        typed(&mut composer, "abc");
+        composer.key(ctrl('u'));
+        assert_eq!(
+            state(&composer),
+            ("keep\nthrow away this".into(), (1, 0), Mode::Insert)
+        );
+
+        typed(&mut composer, "throw ");
+        composer.key(ctrl('k'));
+        assert_eq!(
+            state(&composer),
+            ("keep\nthrow ".into(), (1, 6), Mode::Insert)
+        );
+        // Neither takes the line break with it.
+        composer.key(ctrl('u'));
+        assert_eq!(composer.lines(), ["keep", ""]);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_back_by_the_word_rule_b_moves_by() {
+        let mut composer = fresh();
+        composer.paste("alpha beta_two, gamma");
+        composer.key(ctrl('w'));
+        assert_eq!(composer.text(), "alpha beta_two, ");
+        // `b` steps between character classes, so the punctuation is its own
+        // word and goes on its own.
+        composer.key(ctrl('w'));
+        assert_eq!(composer.text(), "alpha beta_two");
+        composer.key(ctrl('w'));
+        assert_eq!(state(&composer), ("alpha ".into(), (0, 6), Mode::Insert));
+        composer.key(ctrl('w'));
+        composer.key(ctrl('w'));
+        assert_eq!(composer.text(), "");
+    }
+
+    #[test]
     fn a_paste_inserts_its_line_breaks_instead_of_submitting() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("first\nsecond");
         assert_eq!(composer.text(), "first\nsecond");
         assert_eq!(composer.cursor(), (1, 6));
 
         // A terminal sends pasted line breaks as carriage returns.
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("first\rsecond\r\nthird");
         assert_eq!(composer.lines(), ["first", "second", "third"]);
     }
 
     #[test]
     fn hjkl_moves_and_stops_at_the_buffer_edges() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("abc\ndefgh");
         escape(&mut composer);
         // Normal mode has no column past the last character, so coming up from
@@ -690,7 +835,7 @@ mod tests {
 
     #[test]
     fn j_and_k_keep_the_column_across_a_short_line() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("longest line\nab\nanother long one");
         escape(&mut composer);
         typed(&mut composer, "kk$");
@@ -703,7 +848,7 @@ mod tests {
 
     #[test]
     fn word_motions_step_between_character_classes() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("alpha beta_two, gamma");
         escape(&mut composer);
         typed(&mut composer, "0");
@@ -721,7 +866,7 @@ mod tests {
 
     #[test]
     fn counts_multiply_across_motions() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("one two three four five");
         escape(&mut composer);
         typed(&mut composer, "0");
@@ -735,7 +880,7 @@ mod tests {
 
     #[test]
     fn x_deletes_a_count_of_characters_within_the_line() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("abcdef\ngh");
         escape(&mut composer);
         typed(&mut composer, "kk0");
@@ -747,7 +892,7 @@ mod tests {
 
     #[test]
     fn delete_with_a_motion_uses_the_motions_own_scope() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("alpha beta gamma");
         escape(&mut composer);
         typed(&mut composer, "0dw");
@@ -760,7 +905,7 @@ mod tests {
 
     #[test]
     fn counts_on_both_sides_of_an_operator_multiply() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("one two three four five six");
         escape(&mut composer);
         typed(&mut composer, "0");
@@ -770,7 +915,7 @@ mod tests {
 
     #[test]
     fn dd_deletes_whole_lines_and_a_count_deletes_several() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("one\ntwo\nthree\nfour");
         escape(&mut composer);
         typed(&mut composer, "kkk");
@@ -784,7 +929,7 @@ mod tests {
 
     #[test]
     fn a_linewise_motion_makes_its_operator_linewise() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("one\ntwo\nthree");
         escape(&mut composer);
         typed(&mut composer, "kk");
@@ -796,7 +941,7 @@ mod tests {
 
     #[test]
     fn i_a_o_and_shift_o_enter_insert_mode_where_vim_puts_them() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("ab");
         escape(&mut composer);
         typed(&mut composer, "i");
@@ -817,9 +962,9 @@ mod tests {
 
     #[test]
     fn multiline_editing_survives_a_round_trip_through_normal_mode() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         typed(&mut composer, "first");
-        composer.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        composer.key(ctrl('j'));
         typed(&mut composer, "second");
         escape(&mut composer);
         typed(&mut composer, "k0");
@@ -837,7 +982,7 @@ mod tests {
 
     #[test]
     fn history_recalls_earlier_prompts_and_returns_to_the_live_buffer() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         typed(&mut composer, "one");
         assert_eq!(composer.take(), "one");
         typed(&mut composer, "two");
@@ -859,8 +1004,27 @@ mod tests {
     }
 
     #[test]
+    fn the_text_after_a_marker_is_readable_and_replaceable() {
+        let mut composer = fresh();
+        typed(&mut composer, "look at @com");
+        let at = composer.offset() - 3;
+        assert_eq!(composer.text_after(at).as_deref(), Some("com"));
+
+        composer.replace_range(at - 1, "psi/src/tui/composer.rs");
+        assert_eq!(composer.text(), "look at psi/src/tui/composer.rs");
+
+        // Backspacing past the marker is how the picker learns it is gone.
+        let mut composer = fresh();
+        typed(&mut composer, "@c");
+        let at = composer.offset() - 1;
+        composer.key(key(KeyCode::Backspace));
+        composer.key(key(KeyCode::Backspace));
+        assert_eq!(composer.text_after(at), None);
+    }
+
+    #[test]
     fn loading_a_past_message_leaves_it_ready_to_edit() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.load("make the test pass");
         assert_eq!(
             state(&composer),
@@ -870,7 +1034,7 @@ mod tests {
 
     #[test]
     fn an_unknown_key_abandons_a_half_typed_command() {
-        let mut composer = Composer::new();
+        let mut composer = fresh();
         composer.paste("one two three");
         escape(&mut composer);
         typed(&mut composer, "0");

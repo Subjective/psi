@@ -9,9 +9,12 @@
 mod app;
 mod composer;
 mod draw;
+mod files;
+mod history;
 mod view;
 
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as TerminalEvent};
@@ -19,6 +22,9 @@ use psi_core::protocol::{Command, Event};
 use tokio::sync::mpsc;
 
 use app::App;
+use history::History;
+
+pub use app::HELP;
 
 /// How long the reader thread waits for a key before checking whether Psi is
 /// still there. Blocking on `read` forever would leave a thread that eats the
@@ -27,14 +33,21 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// Runs until the user quits or the harness goes away. The terminal is restored
 /// on every path out, including a panic.
+///
+/// `workspace` is what the `@` picker walks and `sessions_dir` is where the
+/// prompt history is kept; both are the process's own configuration, which is
+/// why they arrive as arguments rather than over the protocol.
 pub async fn run(
     commands: mpsc::Sender<Command>,
     mut events: mpsc::Receiver<Event>,
     resume: bool,
+    workspace: PathBuf,
+    sessions_dir: PathBuf,
 ) -> io::Result<()> {
+    let (history, prompts) = History::open(&sessions_dir);
     let mut terminal = draw::enter()?;
     let mut keys = spawn_reader();
-    let mut app = App::new();
+    let mut app = App::new(workspace, history, prompts);
     app.start(resume);
 
     let outcome = 'session: loop {

@@ -22,7 +22,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use super::app::App;
-use super::composer::Mode;
 use super::view::{DisplayLine, Tone};
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -136,8 +135,15 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             );
         }
 
-        // Scroll the composer so the cursor's row is the last one shown.
-        let top = area.y + available - composer_rows;
+        // Scroll the composer so the cursor's row is the last one shown. With
+        // nothing live it abuts the scrollback instead, so a submitted prompt
+        // lands exactly on the rows where it was typed and the composer moves
+        // below it.
+        let top = if live.is_empty() {
+            area.y
+        } else {
+            area.y + available - composer_rows
+        };
         let first = cursor.0.saturating_sub(composer_rows as usize - 1);
         for offset in 0..composer_rows as usize {
             let Some(row) = rows.get(first + offset) else {
@@ -156,11 +162,12 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             top + (cursor.0 - first) as u16,
         ));
 
+        // The status row carries news only, so it is often empty; it is dim
+        // text rather than a bar, which would be a full-width block of colour
+        // saying nothing.
         let status = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
         frame.render_widget(truncate(&app.status(), width).as_str(), status);
-        frame
-            .buffer_mut()
-            .set_style(status, status_style(composer.mode()));
+        frame.buffer_mut().set_style(status, style(Tone::Notice));
     })?;
     Ok(())
 }
@@ -176,6 +183,7 @@ fn style(tone: Tone) -> Style {
         Tone::ToolOutput => Style::default().fg(Color::DarkGray),
         Tone::DiffAdded => Style::default().fg(Color::Green),
         Tone::DiffRemoved => Style::default().fg(Color::Red),
+        Tone::Code => Style::default().add_modifier(Modifier::DIM),
         Tone::Notice => Style::default().fg(Color::DarkGray),
         Tone::Error => Style::default().fg(Color::Red),
         Tone::Selected => Style::default()
@@ -184,21 +192,42 @@ fn style(tone: Tone) -> Style {
     }
 }
 
-fn status_style(mode: Mode) -> Style {
-    let colour = match mode {
-        Mode::Insert => Color::Green,
-        Mode::Normal => Color::Blue,
-    };
-    Style::default().fg(Color::Black).bg(colour)
-}
-
 fn wrap_all(lines: &[DisplayLine], width: usize) -> Vec<(Tone, String)> {
     lines
         .iter()
         .flat_map(|line| {
-            wrap(&line.text, width)
-                .into_iter()
-                .map(move |row| (line.tone, row))
+            let rows = match line.tone {
+                // A prompt echo re-wraps the way the composer wrapped it, so a
+                // submitted prompt lands on the rows where it was typed.
+                Tone::User => wrap_gutter(&line.text, width),
+                _ => wrap(&line.text, width),
+            };
+            rows.into_iter().map(move |row| (line.tone, row))
+        })
+        .collect()
+}
+
+/// Splits a line's two-character gutter off and hard-wraps the rest at the
+/// composer's content width, indenting continuation rows to the gutter — the
+/// composer's own rendering, reproduced.
+fn wrap_gutter(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let (gutter, content) = chars.split_at(chars.len().min(GUTTER));
+    let gutter: String = gutter.iter().collect();
+    let width = width.saturating_sub(GUTTER).max(1);
+    if content.is_empty() {
+        return vec![gutter];
+    }
+    content
+        .chunks(width)
+        .enumerate()
+        .map(|(number, chunk)| {
+            let prefix = if number == 0 {
+                gutter.clone()
+            } else {
+                " ".repeat(GUTTER)
+            };
+            prefix + &chunk.iter().collect::<String>()
         })
         .collect()
 }
@@ -310,6 +339,25 @@ mod tests {
             wrap("/a/very/long/path/with/no/spaces", 10),
             ["/a/very/lo", "ng/path/wi", "th/no/spac", "es"]
         );
+    }
+
+    #[test]
+    fn a_prompt_echo_reproduces_the_composer_rows_exactly() {
+        // Same content, same width: the echo's rows must equal the composer's
+        // gutter and wrap, or a submitted prompt visibly moves.
+        let content = "0123456789ab";
+        let (composer_rows, _) = wrap_composer(&[content.to_string()], (0, 0), 10 - GUTTER);
+        let echo = wrap_all(&[DisplayLine::new(Tone::User, format!("> {content}"))], 10);
+        let echo_rows: Vec<String> = echo.into_iter().map(|(_, row)| row).collect();
+        let expected: Vec<String> = composer_rows
+            .iter()
+            .enumerate()
+            .map(|(number, row)| {
+                let gutter = if number == 0 { "> " } else { "  " };
+                format!("{gutter}{row}")
+            })
+            .collect();
+        assert_eq!(echo_rows, expected);
     }
 
     #[test]
