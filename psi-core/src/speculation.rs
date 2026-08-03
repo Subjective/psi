@@ -168,6 +168,15 @@ impl SpeculationRuntime {
         self.cache.remove(key)
     }
 
+    /// Entries still executing. They count against the next round's fanout:
+    /// the execution budget caps concurrency, not starts per round.
+    pub fn in_flight(&self) -> usize {
+        self.cache
+            .values()
+            .filter(|entry| !entry.handle.is_finished())
+            .count()
+    }
+
     /// Drops every entry made against an older revision. Called after a
     /// mutation bumps the revision: a stale result must never be adopted, so
     /// in-flight executions are aborted rather than left to finish.

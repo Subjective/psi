@@ -648,7 +648,11 @@ impl Engine {
                     .collect(),
             });
 
-        let mut started = 0;
+        let mut started = self
+            .speculation
+            .as_ref()
+            .map(|spec| spec.in_flight())
+            .unwrap_or(0);
         for call in guesses {
             if started >= budget {
                 break;
