@@ -56,9 +56,11 @@ pub const HELP: &[&str] = &[
 ];
 
 /// The branch picker: the whole tree of user messages with their depths, and
-/// the ones still matching what has been typed.
+/// the ones still matching the query. The composer is the query box while the
+/// picker is open, so `draft` holds whatever was being typed for Esc to
+/// restore.
 struct Branch {
-    query: String,
+    draft: String,
     matches: Vec<(ItemId, usize)>,
     selected: usize,
 }
@@ -69,7 +71,7 @@ struct Branch {
 /// at the moment the picker opened; `matches` is them, narrowed by the query.
 struct Sessions {
     rows: Vec<(SessionId, String)>,
-    query: String,
+    draft: String,
     matches: Vec<(SessionId, String)>,
     selected: usize,
 }
@@ -392,9 +394,11 @@ impl App {
             }
             "new" => self.outbox.push(Command::CreateSession),
             "resume" => {
+                // The submit that carried `/resume` already cleared the
+                // composer, which is the picker's query box from here.
                 self.mode = AppMode::Sessions(Sessions {
                     rows: Vec::new(),
-                    query: String::new(),
+                    draft: String::new(),
                     matches: Vec::new(),
                     selected: 0,
                 });
@@ -413,43 +417,48 @@ impl App {
         }
     }
 
-    /// Keys in the session picker: typing filters — like every typed picker,
-    /// selection is arrows and ^p/^n, since letters belong to the query.
+    /// Keys in the session picker: typing goes to the composer, which is the
+    /// query box while the picker is open — like every typed picker, selection
+    /// is arrows and ^p/^n.
     fn sessions_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Enter => self.load_selected_session(),
-            KeyCode::Esc => self.mode = AppMode::Compose,
-            KeyCode::Backspace => {
-                if let AppMode::Sessions(picker) = &mut self.mode {
-                    picker.query.pop();
-                }
+            KeyCode::Esc => self.close_picker(),
+            _ => {
+                self.composer.key(key);
                 self.filter_sessions();
             }
-            KeyCode::Char(typed) => {
-                if let AppMode::Sessions(picker) = &mut self.mode {
-                    picker.query.push(typed);
-                }
-                self.filter_sessions();
-            }
-            _ => {}
         }
     }
 
-    /// Narrows the rows to subsequence matches of the query, keeping their
-    /// newest-first order: typing filters, it does not re-rank.
+    /// Narrows the rows to subsequence matches of the composer's text, keeping
+    /// their newest-first order: typing filters, it does not re-rank.
     fn filter_sessions(&mut self) {
+        let query = self.composer.text();
         let AppMode::Sessions(picker) = &mut self.mode else {
             return;
         };
         picker.matches = picker
             .rows
             .iter()
-            .filter(|(_, row)| files::score(&picker.query, row).is_some())
+            .filter(|(_, row)| files::score(&query, row).is_some())
             .cloned()
             .collect();
         picker.selected = picker.selected.min(picker.matches.len().saturating_sub(1));
+    }
+
+    /// Closes the session or branch picker, giving the composer back what was
+    /// being typed before it became the query box.
+    fn close_picker(&mut self) {
+        let draft = match &self.mode {
+            AppMode::Sessions(picker) => picker.draft.clone(),
+            AppMode::Branch(branch) => branch.draft.clone(),
+            _ => return,
+        };
+        self.composer.load(&draft);
+        self.mode = AppMode::Compose;
     }
 
     /// Keys in the file picker. Everything the picker does not claim is typing,
@@ -592,37 +601,29 @@ impl App {
         self.outbox.push(Command::LoadSession {
             session_id: session_id.clone(),
         });
-        self.mode = AppMode::Compose;
+        self.close_picker();
     }
 
-    /// Keys in the branch tree: typing filters, Enter edits the selection to
-    /// fork, Tab jumps to the branch it is on.
+    /// Keys in the branch tree: typing goes to the composer as the query,
+    /// Enter edits the selection to fork, Tab jumps to the branch it is on.
     fn branch_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Tab => self.jump_to_selected(),
             KeyCode::Enter => self.fork(),
-            KeyCode::Esc => self.mode = AppMode::Compose,
-            KeyCode::Backspace => {
-                if let AppMode::Branch(branch) = &mut self.mode {
-                    branch.query.pop();
-                }
+            KeyCode::Esc => self.close_picker(),
+            _ => {
+                self.composer.key(key);
                 self.filter_branch();
             }
-            KeyCode::Char(typed) => {
-                if let AppMode::Branch(branch) = &mut self.mode {
-                    branch.query.push(typed);
-                }
-                self.filter_branch();
-            }
-            _ => {}
         }
     }
 
-    /// Narrows the tree to subsequence matches of the query, keeping its
-    /// depth-first order and each match's own indent.
+    /// Narrows the tree to subsequence matches of the composer's text, keeping
+    /// its depth-first order and each match's own indent.
     fn filter_branch(&mut self) {
+        let query = self.composer.text();
         let tree = self.view.message_tree();
         let AppMode::Branch(branch) = &mut self.mode else {
             return;
@@ -634,7 +635,7 @@ impl App {
                     Some(ItemPayload::UserMessage { text }) => text.as_str(),
                     _ => "",
                 };
-                files::score(&branch.query, text).is_some()
+                files::score(&query, text).is_some()
             })
             .collect();
         branch.selected = branch.selected.min(branch.matches.len().saturating_sub(1));
@@ -661,7 +662,7 @@ impl App {
 
     fn toggle_branch_mode(&mut self) {
         if matches!(self.mode, AppMode::Branch(_)) {
-            self.mode = AppMode::Compose;
+            self.close_picker();
             return;
         }
         // A `set_head` sent mid-turn would be held until the turn ended and
@@ -677,8 +678,12 @@ impl App {
             .last()
             .and_then(|at| matches.iter().position(|(id, _)| id == at))
             .unwrap_or(0);
+        // The composer becomes the query box; what was being typed comes back
+        // when the picker closes without choosing.
+        let draft = self.composer.text();
+        self.composer.load("");
         self.mode = AppMode::Branch(Branch {
-            query: String::new(),
+            draft,
             matches,
             selected,
         });
@@ -696,7 +701,7 @@ impl App {
         };
         let tip = self.view.tip_of(id);
         self.set_head(Some(tip));
-        self.mode = AppMode::Compose;
+        self.close_picker();
     }
 
     /// Editing a past message is `set_head` to the item before it followed by a
@@ -1185,6 +1190,39 @@ mod tests {
                 "one".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn picker_queries_type_through_the_composer_and_esc_restores_the_draft() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut driver = driver(vec![text("one")], &sessions);
+        driver.app.start(false);
+        driver.until(|d| d.app.session.is_some()).await;
+        typed(&mut driver.app, "go");
+        driver.app.on_key(key(KeyCode::Enter));
+        driver.until(|d| d.turns == 1).await;
+
+        typed(&mut driver.app, "half a thought");
+        driver.app.on_key(ctrl('b'));
+        // The composer is the query box now, so typing is visible there.
+        assert!(driver.app.composer.is_blank());
+        typed(&mut driver.app, "zz");
+        assert_eq!(driver.app.composer.text(), "zz");
+        let rows: Vec<String> = driver
+            .app
+            .overlay()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(rows, ["no messages match"]);
+        driver.app.on_key(key(KeyCode::Backspace));
+        driver.app.on_key(key(KeyCode::Backspace));
+        assert_eq!(driver.app.overlay().len(), 1);
+
+        // Esc hands the composer back what was being typed.
+        driver.app.on_key(key(KeyCode::Esc));
+        assert!(matches!(driver.app.mode, AppMode::Compose));
+        assert_eq!(driver.app.composer.text(), "half a thought");
     }
 
     #[tokio::test]
