@@ -61,7 +61,7 @@ pub const HELP: &[&str] = &[
 /// restore.
 struct Branch {
     draft: String,
-    matches: Vec<(ItemId, usize)>,
+    matches: Vec<view::MessageRow>,
     selected: usize,
 }
 
@@ -188,12 +188,18 @@ impl App {
                     branch
                         .matches
                         .iter()
-                        .map(|(id, depth)| {
-                            let text = match self.view.item(*id).map(|item| &item.payload) {
+                        .map(|row| {
+                            let text = match self.view.item(row.id).map(|item| &item.payload) {
                                 Some(ItemPayload::UserMessage { text }) => text.replace('\n', " "),
                                 _ => String::new(),
                             };
-                            format!("{}{text}", "  ".repeat(*depth))
+                            // An alternative announces itself; what follows it
+                            // sits flat underneath.
+                            let indent = match row.alternative {
+                                true => format!("{}└ ", "  ".repeat(row.depth.saturating_sub(1))),
+                                false => "  ".repeat(row.depth),
+                            };
+                            format!("{indent}{text}")
                         })
                         .collect(),
                     branch.selected,
@@ -630,8 +636,8 @@ impl App {
         };
         branch.matches = tree
             .into_iter()
-            .filter(|(id, _)| {
-                let text = match self.view.item(*id).map(|item| &item.payload) {
+            .filter(|row| {
+                let text = match self.view.item(row.id).map(|item| &item.payload) {
                     Some(ItemPayload::UserMessage { text }) => text.as_str(),
                     _ => "",
                 };
@@ -676,7 +682,7 @@ impl App {
             .view
             .user_messages()
             .last()
-            .and_then(|at| matches.iter().position(|(id, _)| id == at))
+            .and_then(|at| matches.iter().position(|row| row.id == *at))
             .unwrap_or(0);
         // The composer becomes the query box; what was being typed comes back
         // when the picker closes without choosing.
@@ -696,10 +702,10 @@ impl App {
         let AppMode::Branch(branch) = &self.mode else {
             return;
         };
-        let Some((id, _)) = branch.matches.get(branch.selected).copied() else {
+        let Some(row) = branch.matches.get(branch.selected).copied() else {
             return;
         };
-        let tip = self.view.tip_of(id);
+        let tip = self.view.tip_of(row.id);
         self.set_head(Some(tip));
         self.close_picker();
     }
@@ -711,10 +717,10 @@ impl App {
         let AppMode::Branch(branch) = &self.mode else {
             return;
         };
-        let Some((id, _)) = branch.matches.get(branch.selected).copied() else {
+        let Some(row) = branch.matches.get(branch.selected).copied() else {
             return;
         };
-        let Some(item) = self.view.item(id) else {
+        let Some(item) = self.view.item(row.id) else {
             return;
         };
         let parent = item.parent_id;

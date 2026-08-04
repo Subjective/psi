@@ -82,6 +82,15 @@ struct Open {
     flushed: usize,
 }
 
+/// One row of the branch picker's tree: a user message, how many forks sit
+/// above it, and whether it is the first message of an alternative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageRow {
+    pub id: ItemId,
+    pub depth: usize,
+    pub alternative: bool,
+}
+
 pub struct View {
     items: Vec<Item>,
     index: HashMap<ItemId, usize>,
@@ -227,10 +236,12 @@ impl View {
         }
     }
 
-    /// Every user message in the tree, depth-first in id order, each with how
-    /// many user messages sit above it. The branch picker shows the whole
-    /// tree, abandoned futures included, indented by that depth.
-    pub fn message_tree(&self) -> Vec<(ItemId, usize)> {
+    /// Every user message in the tree, depth-first in id order. Depth counts
+    /// forks, not generations: a linear conversation sits flat, and only an
+    /// alternative — a message whose parent has others — steps in, marked as
+    /// the start of one. The branch picker shows this whole tree, abandoned
+    /// futures included.
+    pub fn message_tree(&self) -> Vec<MessageRow> {
         // Each user message hangs off its nearest user-message ancestor.
         let mut children: HashMap<Option<ItemId>, Vec<ItemId>> = HashMap::new();
         for item in &self.items {
@@ -250,15 +261,32 @@ impl View {
             children.entry(parent).or_default().push(item.id);
         }
         let mut tree = Vec::new();
-        let mut stack: Vec<(ItemId, usize)> = children
+        let mut stack: Vec<MessageRow> = children
             .get(&None)
-            .map(|roots| roots.iter().rev().map(|id| (*id, 0)).collect())
+            .map(|roots| {
+                let forked = roots.len() > 1;
+                roots
+                    .iter()
+                    .rev()
+                    .map(|id| MessageRow {
+                        id: *id,
+                        depth: usize::from(forked),
+                        alternative: forked,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        while let Some((id, depth)) = stack.pop() {
-            tree.push((id, depth));
-            if let Some(kids) = children.get(&Some(id)) {
-                stack.extend(kids.iter().rev().map(|kid| (*kid, depth + 1)));
+        while let Some(row) = stack.pop() {
+            let below = children.get(&Some(row.id));
+            if let Some(kids) = below {
+                let forked = kids.len() > 1;
+                stack.extend(kids.iter().rev().map(|kid| MessageRow {
+                    id: *kid,
+                    depth: row.depth + usize::from(forked),
+                    alternative: forked,
+                }));
             }
+            tree.push(row);
         }
         tree
     }
@@ -1291,10 +1319,16 @@ mod tests {
     #[test]
     fn the_message_tree_indents_forks_and_finds_their_tips() {
         let view = forked();
-        // Both "second"s hang off "first": the abandoned one stays visible.
+        // Both "second"s hang off "first": the abandoned one stays visible,
+        // each marked as an alternative one fork deep; "first" sits flat.
+        let row = |id, depth, alternative| MessageRow {
+            id: ItemId(id),
+            depth,
+            alternative,
+        };
         assert_eq!(
             view.message_tree(),
-            [(ItemId(0), 0), (ItemId(2), 1), (ItemId(4), 1)]
+            [row(0, 0, false), row(2, 1, true), row(4, 1, true)]
         );
         // Jumping back to the abandoned branch lands on its tip.
         assert_eq!(view.tip_of(ItemId(2)), ItemId(3));
