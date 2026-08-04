@@ -22,6 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use super::app::App;
+use super::composer::Mode;
 use super::view::{DisplayLine, Tone};
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -72,7 +73,12 @@ fn open() -> io::Result<Tui> {
 /// why it takes no terminal.
 pub fn restore() -> io::Result<()> {
     let mut stdout = io::stdout();
-    execute!(stdout, DisableBracketedPaste, cursor::Show)?;
+    execute!(
+        stdout,
+        DisableBracketedPaste,
+        cursor::SetCursorStyle::DefaultUserShape,
+        cursor::Show
+    )?;
     disable_raw_mode()
 }
 
@@ -120,10 +126,13 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
         let (rows, cursor) = wrap_composer(&composer.lines(), composer.cursor(), width - GUTTER);
         let available = area.height - 1;
         let composer_rows = (rows.len() as u16).clamp(1, available);
-        let live_rows = available - composer_rows;
 
+        // A picker opens below the composer, so opening one never moves the
+        // text being typed; the streaming tail takes whatever rows remain.
+        let overlay = wrap_all(&app.overlay(), width);
+        let overlay_rows = (overlay.len() as u16).min(available - composer_rows);
         let live = wrap_all(&app.live(), width);
-        let live = window(&live, live_rows as usize);
+        let live = window(&live, (available - composer_rows - overlay_rows) as usize);
         for (offset, (tone, text)) in live.iter().enumerate() {
             frame.render_widget(
                 text.as_str(),
@@ -135,15 +144,11 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             );
         }
 
-        // Scroll the composer so the cursor's row is the last one shown. With
-        // nothing live it abuts the scrollback instead, so a submitted prompt
-        // lands exactly on the rows where it was typed and the composer moves
-        // below it.
-        let top = if live.is_empty() {
-            area.y
-        } else {
-            area.y + available - composer_rows
-        };
+        // The composer rides directly under the streaming tail: an empty tail
+        // leaves it against the scrollback — where a submitted prompt lands on
+        // the rows it was typed on — and a finished turn returns it there
+        // without leaping across the viewport.
+        let top = area.y + live.len() as u16;
         let first = cursor.0.saturating_sub(composer_rows as usize - 1);
         for offset in 0..composer_rows as usize {
             let Some(row) = rows.get(first + offset) else {
@@ -162,6 +167,14 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             top + (cursor.0 - first) as u16,
         ));
 
+        for (offset, (tone, text)) in overlay.iter().take(overlay_rows as usize).enumerate() {
+            let y = top + composer_rows + offset as u16;
+            frame.render_widget(text.as_str(), Rect::new(area.x, y, area.width, 1));
+            frame
+                .buffer_mut()
+                .set_style(Rect::new(area.x, y, area.width, 1), style(*tone));
+        }
+
         // The status row carries news only, so it is often empty; it is dim
         // text rather than a bar, which would be a full-width block of colour
         // saying nothing.
@@ -169,6 +182,13 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
         frame.render_widget(truncate(&app.status(), width).as_str(), status);
         frame.buffer_mut().set_style(status, style(Tone::Notice));
     })?;
+    // Vim's own signal, in place of a mode readout: a bar cursor writes, a
+    // block cursor commands. Terminals without DECSCUSR ignore the escape.
+    let shape = match app.composer().mode() {
+        Mode::Insert => cursor::SetCursorStyle::SteadyBar,
+        Mode::Normal => cursor::SetCursorStyle::SteadyBlock,
+    };
+    execute!(io::stdout(), shape)?;
     Ok(())
 }
 

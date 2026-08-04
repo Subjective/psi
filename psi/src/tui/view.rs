@@ -212,9 +212,9 @@ impl View {
         }
     }
 
-    /// The branch picker: the past messages of the active path, plus where that
-    /// path sits among the tree's branches.
-    pub fn branch_lines(&self, selected: usize, leaf: usize, leaves: usize) -> Vec<DisplayLine> {
+    /// The branch picker: the past messages of the active path. Which branch
+    /// the path is sits in the status row.
+    pub fn branch_lines(&self, selected: usize) -> Vec<DisplayLine> {
         let rows = self
             .user_messages()
             .into_iter()
@@ -223,14 +223,7 @@ impl View {
                 _ => String::new(),
             })
             .collect();
-        picker(
-            format!(
-                "branch {}/{leaves} — k/j select · enter edit · tab branch · esc close",
-                leaf + 1
-            ),
-            rows,
-            selected,
-        )
+        picker(rows, selected)
     }
 
     pub fn apply(&mut self, payload: &EventPayload) {
@@ -270,6 +263,10 @@ impl View {
                     }
                     CompletionStatus::Completed => {}
                 }
+                // Turns separate when they end, not when the next prompt
+                // arrives, so the blank sits above the idle composer instead of
+                // pushing the next echo off its rows.
+                self.separate();
             }
             EventPayload::SessionCreated { meta } => self.reset(&meta.id),
             EventPayload::SessionsListed { .. } => {}
@@ -302,6 +299,11 @@ impl View {
             format!("psi: branch of {} items", items.len()),
         ));
         for item in &items {
+            // The live flow separates turns as they finish; a reprint
+            // recreates that spacing before each prompt.
+            if matches!(item.payload, ItemPayload::UserMessage { .. }) {
+                self.separate();
+            }
             self.render(item, 0);
         }
         self.flush_pending();
@@ -325,6 +327,9 @@ impl View {
             ),
         ));
         for item in self.path().into_iter().cloned().collect::<Vec<_>>() {
+            if matches!(item.payload, ItemPayload::UserMessage { .. }) {
+                self.separate();
+            }
             self.render(&item, 0);
         }
         self.flush_pending();
@@ -379,9 +384,9 @@ impl View {
     fn render(&mut self, item: &Item, skip: usize) {
         match &item.payload {
             ItemPayload::UserMessage { text } => {
-                self.separate();
-                // The composer's own gutters, so the echo lands on the rows
-                // where the prompt was typed.
+                // The composer's own gutters, and no separator: the echo lands
+                // exactly on the rows where the prompt was typed. The blank
+                // above it was already pushed when the previous turn finished.
                 for (number, line) in text.lines().enumerate() {
                     let gutter = if number == 0 { "> " } else { "  " };
                     self.push(DisplayLine::new(Tone::User, format!("{gutter}{line}")));
@@ -560,20 +565,21 @@ impl View {
     }
 }
 
-/// A list over the composer: a header naming its keys, then one row per
-/// entry with the selected one marked. Branch mode, `/resume` and the `@`
-/// picker are the same widget over different rows.
-pub fn picker(header: String, rows: Vec<String>, selected: usize) -> Vec<DisplayLine> {
-    let mut lines = vec![DisplayLine::new(Tone::Notice, header)];
-    for (position, row) in rows.into_iter().enumerate() {
-        let (tone, marker) = if position == selected {
-            (Tone::Selected, ">")
-        } else {
-            (Tone::User, " ")
-        };
-        lines.push(DisplayLine::new(tone, format!("{marker} {row}")));
-    }
-    lines
+/// A selection list: one row per entry with the selected one marked. Branch
+/// mode, `/resume` and the `@` picker are the same widget over different rows;
+/// their keys live in `/help`, not in a header.
+pub fn picker(rows: Vec<String>, selected: usize) -> Vec<DisplayLine> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(position, row)| {
+            let (tone, marker) = if position == selected {
+                (Tone::Selected, ">")
+            } else {
+                (Tone::User, " ")
+            };
+            DisplayLine::new(tone, format!("{marker} {row}"))
+        })
+        .collect()
 }
 
 /// How long ago something happened, coarsely. A session list is chosen from by
@@ -803,6 +809,7 @@ mod tests {
                 (Tone::User, "> make the test pass".to_string()),
                 (Tone::Notice, String::new()),
                 (Tone::Assistant, "All done.".to_string()),
+                (Tone::Notice, String::new()),
             ]
         );
         assert!(!view.running());
@@ -1068,6 +1075,7 @@ mod tests {
                     Tone::Error,
                     "  the response completed before the arguments did".to_string()
                 ),
+                (Tone::Notice, String::new()),
             ]
         );
     }
@@ -1106,6 +1114,7 @@ mod tests {
                 (Tone::Assistant, "partial".to_string()),
                 (Tone::Notice, "  [cancelled]".to_string()),
                 (Tone::Notice, "psi: turn cancelled".to_string()),
+                (Tone::Notice, String::new()),
             ]
         );
         assert!(!view.running());
@@ -1123,7 +1132,10 @@ mod tests {
         });
         assert_eq!(
             drain(&mut view),
-            [(Tone::Error, "psi: connection reset".to_string())]
+            [
+                (Tone::Error, "psi: connection reset".to_string()),
+                (Tone::Notice, String::new()),
+            ]
         );
     }
 
@@ -1187,17 +1199,13 @@ mod tests {
     #[test]
     fn the_branch_list_marks_the_selected_message() {
         let view = forked();
-        let lines = view.branch_lines(1, 1, 2);
+        let lines = view.branch_lines(1);
         assert_eq!(
             lines
                 .iter()
                 .map(|line| (line.tone, line.text.as_str()))
                 .collect::<Vec<_>>(),
             [
-                (
-                    Tone::Notice,
-                    "branch 2/2 — k/j select · enter edit · tab branch · esc close"
-                ),
                 (Tone::User, "  first"),
                 (Tone::Selected, "> second, revised"),
             ]

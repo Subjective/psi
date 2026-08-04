@@ -23,7 +23,7 @@ use psi_core::session::SessionId;
 use super::composer::{Composer, Mode, Outcome};
 use super::files;
 use super::history::History;
-use super::view::{self, DisplayLine, View};
+use super::view::{self, DisplayLine, Tone, View};
 
 /// Wall-clock milliseconds, for the ages the session picker shows. The harness
 /// stamps its own; this is the client asking what time it is now.
@@ -150,43 +150,37 @@ impl App {
         &self.composer
     }
 
-    /// What the viewport shows above the composer: an open overlay, otherwise
-    /// whatever is still streaming.
+    /// What the viewport shows above the composer: whatever is still
+    /// streaming.
     pub fn live(&self) -> Vec<DisplayLine> {
+        self.view.live()
+    }
+
+    /// The open picker, drawn below the composer so opening one never moves
+    /// the text being typed.
+    pub fn overlay(&self) -> Vec<DisplayLine> {
         match &self.mode {
-            AppMode::Compose => self.view.live(),
-            AppMode::Branch(branch) => self.view.branch_lines(
-                branch.selected,
-                branch.leaf,
-                self.view.leaves().len().max(1),
-            ),
-            AppMode::Sessions(sessions) => view::picker(
-                match sessions.rows.is_empty() {
-                    true => "no sessions yet — esc closes".to_string(),
-                    false => "sessions — k/j select · enter load · esc close".to_string(),
-                },
-                sessions.rows.iter().map(|(_, row)| row.clone()).collect(),
-                sessions.selected,
-            ),
-            AppMode::Files(files) => view::picker(
-                match files.matches.is_empty() {
-                    true => "no files match — esc closes".to_string(),
-                    false => "files — ^p/^n select · enter insert · esc close".to_string(),
-                },
-                files.matches.clone(),
-                files.selected,
-            ),
+            AppMode::Compose => Vec::new(),
+            AppMode::Branch(branch) => self.view.branch_lines(branch.selected),
+            AppMode::Sessions(sessions) => match sessions.rows.is_empty() {
+                true => vec![DisplayLine::new(Tone::Notice, "no sessions yet")],
+                false => view::picker(
+                    sessions.rows.iter().map(|(_, row)| row.clone()).collect(),
+                    sessions.selected,
+                ),
+            },
+            AppMode::Files(files) => match files.matches.is_empty() {
+                true => vec![DisplayLine::new(Tone::Notice, "no files match")],
+                false => view::picker(files.matches.clone(), files.selected),
+            },
         }
     }
 
-    /// The status row, which carries news and nothing else: an idle prompt in
-    /// insert mode says nothing at all. Every key it could list is either in
-    /// `/help` or on the header of the overlay that wants it.
+    /// The status row, which carries news and nothing else: an idle prompt
+    /// says nothing at all. The composer's mode is on the cursor's shape, and
+    /// every key is in `/help`.
     pub fn status(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if matches!(self.mode, AppMode::Compose) && self.composer.mode() == Mode::Normal {
-            parts.push("NORMAL".to_string());
-        }
         if self.cancelling {
             parts.push("cancelling".to_string());
         } else if self.view.running() {
@@ -967,13 +961,12 @@ mod tests {
         // Newest first, so the session the run started in is the second row.
         let rows: Vec<String> = driver
             .app
-            .live()
+            .overlay()
             .iter()
             .map(|line| line.text.clone())
             .collect();
-        assert_eq!(rows[0], "sessions — k/j select · enter load · esc close");
         // Each row is the id that loads it and how long ago it started.
-        assert_eq!(rows[2], format!("  {}  just now", first.0));
+        assert_eq!(rows[1], format!("  {}  just now", first.0));
 
         driver.app.on_key(key(KeyCode::Char('j')));
         driver.app.on_key(key(KeyCode::Enter));
@@ -1051,17 +1044,11 @@ mod tests {
         assert!(matches!(driver.app.mode, AppMode::Files(_)));
         let rows: Vec<String> = driver
             .app
-            .live()
+            .overlay()
             .iter()
             .map(|line| line.text.clone())
             .collect();
-        assert_eq!(
-            rows,
-            [
-                "files — ^p/^n select · enter insert · esc close",
-                "> src/tui/composer.rs"
-            ]
-        );
+        assert_eq!(rows, ["> src/tui/composer.rs"]);
         driver.app.on_key(key(KeyCode::Enter));
         assert_eq!(driver.app.composer.text(), "look at src/tui/composer.rs");
         assert!(matches!(driver.app.mode, AppMode::Compose));
@@ -1160,8 +1147,9 @@ mod tests {
         driver.until(|d| d.app.session.is_some()).await;
         // An idle prompt in insert mode has nothing to say.
         assert_eq!(driver.app.status(), "");
+        // Normal mode is on the cursor's shape, not the status row.
         driver.app.on_key(key(KeyCode::Esc));
-        assert_eq!(driver.app.status(), "NORMAL");
+        assert_eq!(driver.app.status(), "");
 
         driver.app.on_key(key(KeyCode::Char('i')));
         typed(&mut driver.app, "go");
@@ -1170,12 +1158,13 @@ mod tests {
         // From insert mode, the first Esc only leaves insert mode.
         assert_eq!(driver.app.status(), "running · esc esc cancels");
         driver.app.on_key(key(KeyCode::Esc));
-        assert_eq!(driver.app.status(), "NORMAL  running · esc cancels");
+        assert_eq!(driver.app.status(), "running · esc cancels");
 
         driver.app.on_key(key(KeyCode::Esc));
-        assert_eq!(driver.app.status(), "NORMAL  cancelling");
+        assert_eq!(driver.app.status(), "cancelling");
         driver.until(|d| d.turns == 1).await;
-        assert_eq!(driver.app.status(), "NORMAL");
+        // The turn is over and normal mode lives on the cursor: nothing to say.
+        assert_eq!(driver.app.status(), "");
     }
 
     #[tokio::test]
