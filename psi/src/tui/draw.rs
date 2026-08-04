@@ -28,10 +28,12 @@ use super::view::{DisplayLine, Tone};
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Rows the inline viewport holds. Ratatui fixes an inline viewport's height
-/// when the terminal is built, so this is a constant: enough for a couple of
-/// lines of streaming text above a short composer and the status row, and few
-/// enough that an idle Psi is a prompt rather than a panel.
-const VIEWPORT_ROWS: u16 = 6;
+/// when the terminal is built, so this is a constant: the streaming tail and
+/// composer with room for a full picker below them and the status row.
+const VIEWPORT_ROWS: u16 = 11;
+
+/// Rows a picker shows at most; longer lists scroll within them.
+const PICKER_ROWS: u16 = 8;
 
 /// The composer's gutter: a prompt marker on the first row, alignment on the
 /// rest.
@@ -130,7 +132,9 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
         // A picker opens below the composer, so opening one never moves the
         // text being typed; the streaming tail takes whatever rows remain.
         let overlay = wrap_all(&app.overlay(), width);
-        let overlay_rows = (overlay.len() as u16).min(available - composer_rows);
+        let overlay_rows = (overlay.len() as u16)
+            .min(PICKER_ROWS)
+            .min(available - composer_rows);
         // Windowed like the live region, so the selection scrolls the list
         // instead of walking off its visible slice.
         let overlay = window(&overlay, overlay_rows as usize);

@@ -292,19 +292,18 @@ impl App {
                 self.toggle_branch_mode();
                 return;
             }
-            // The typed-into overlays take the two keys that would otherwise
-            // walk the prompt history.
+            // With any overlay open, the two history keys move its selection.
             (KeyCode::Char('p'), true) => {
                 match self.mode {
-                    AppMode::Files(_) | AppMode::Commands(_) => self.move_selection(-1),
-                    _ => self.composer.recall_previous(),
+                    AppMode::Compose => self.composer.recall_previous(),
+                    _ => self.move_selection(-1),
                 }
                 return;
             }
             (KeyCode::Char('n'), true) => {
                 match self.mode {
-                    AppMode::Files(_) | AppMode::Commands(_) => self.move_selection(1),
-                    _ => self.composer.recall_next(),
+                    AppMode::Compose => self.composer.recall_next(),
+                    _ => self.move_selection(1),
                 }
                 return;
             }
