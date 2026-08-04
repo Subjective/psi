@@ -180,7 +180,22 @@ impl View {
 
     /// The lines that are still changing: the tail of whatever is streaming.
     /// Redrawn every frame, never written to the scrollback until it is final.
+    ///
+    /// A tail that starts a block is shown with the blank line its block will
+    /// carry once it flushes, so nothing shifts when it does; a tail mid-block
+    /// stays flush against the lines of it already above.
     pub fn live(&self) -> Vec<DisplayLine> {
+        let lines = self.tail();
+        let mid_block = matches!(&self.open, Some(open) if open.flushed > 0);
+        if lines.is_empty() || !self.emitted || mid_block {
+            return lines;
+        }
+        let mut led = vec![DisplayLine::blank()];
+        led.extend(lines);
+        led
+    }
+
+    fn tail(&self) -> Vec<DisplayLine> {
         let Some(open) = &self.open else {
             return if self.running {
                 vec![DisplayLine::new(Tone::Notice, "… working")]
@@ -1194,6 +1209,38 @@ mod tests {
             ]
         );
         assert_eq!(view.user_messages(), [ItemId(0), ItemId(2)]);
+    }
+
+    #[test]
+    fn a_tail_opening_a_block_carries_its_coming_separator() {
+        let mut view = View::new();
+        view.apply(&EventPayload::TurnStarted { turn_id: TurnId(0) });
+        view.apply(&finished(user(0, None, "hi")));
+        // The prompt is out; the placeholder and a streamed first line show
+        // behind the blank their block will keep once it flushes.
+        assert_eq!(
+            view.live()[0],
+            DisplayLine::new(Tone::Notice, String::new())
+        );
+        view.apply(&started(1, ItemKind::AssistantMessage));
+        view.apply(&delta(1, "Hey"));
+        assert_eq!(
+            view.live()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["", "Hey"]
+        );
+        // A tail mid-block sits flush against its flushed lines.
+        view.apply(&delta(1, " there\nand"));
+        drain(&mut view);
+        assert_eq!(
+            view.live()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["and"]
+        );
     }
 
     #[test]

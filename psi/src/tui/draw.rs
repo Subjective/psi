@@ -131,8 +131,13 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
         // text being typed; the streaming tail takes whatever rows remain.
         let overlay = wrap_all(&app.overlay(), width);
         let overlay_rows = (overlay.len() as u16).min(available - composer_rows);
+        // Windowed like the live region, so the selection scrolls the list
+        // instead of walking off its visible slice.
+        let overlay = window(&overlay, overlay_rows as usize);
         let live = wrap_all(&app.live(), width);
-        let live = window(&live, (available - composer_rows - overlay_rows) as usize);
+        // One row stays reserved for the gap under a streaming tail.
+        let live_cap = (available - composer_rows - overlay_rows).saturating_sub(1);
+        let live = window(&live, live_cap as usize);
         for (offset, (tone, text)) in live.iter().enumerate() {
             frame.render_widget(
                 text.as_str(),
@@ -144,11 +149,13 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             );
         }
 
-        // The composer rides directly under the streaming tail: an empty tail
-        // leaves it against the scrollback — where a submitted prompt lands on
-        // the rows it was typed on — and a finished turn returns it there
-        // without leaping across the viewport.
-        let top = area.y + live.len() as u16;
+        // The composer rides under the streaming tail, behind the same blank
+        // the transcript will keep once the tail flushes — so it sits where
+        // the finished turn will leave it and never leaps. An empty tail
+        // leaves it against the scrollback, where a submitted prompt lands on
+        // the rows it was typed on.
+        let gap = if live.is_empty() { 0 } else { 1 };
+        let top = area.y + live.len() as u16 + gap;
         let first = cursor.0.saturating_sub(composer_rows as usize - 1);
         for offset in 0..composer_rows as usize {
             let Some(row) = rows.get(first + offset) else {
@@ -167,7 +174,7 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             top + (cursor.0 - first) as u16,
         ));
 
-        for (offset, (tone, text)) in overlay.iter().take(overlay_rows as usize).enumerate() {
+        for (offset, (tone, text)) in overlay.iter().enumerate() {
             let y = top + composer_rows + offset as u16;
             frame.render_widget(text.as_str(), Rect::new(area.x, y, area.width, 1));
             frame

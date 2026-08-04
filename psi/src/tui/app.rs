@@ -9,9 +9,9 @@
 //! The key and command surface is `HELP`, which `/help` prints into scrollback
 //! and `psi --help` prints to the shell, so there is one list of it.
 //!
-//! Three overlays open over the composer — branch mode, the `/resume` session
-//! list, and the `@` file picker. They are one widget over different rows, and
-//! only one is open at a time.
+//! Four overlays open under the composer — branch mode, the `/resume` session
+//! list, the `@` file picker, and the `/` command palette. They are one widget
+//! over different rows, and only one is open at a time.
 
 use std::path::PathBuf;
 
@@ -71,6 +71,21 @@ struct Sessions {
     selected: usize,
 }
 
+/// The slash commands, each with the line the `/` palette shows for it.
+const COMMANDS: &[(&str, &str)] = &[
+    ("/new", "start a fresh session"),
+    ("/resume", "pick a session to load"),
+    ("/fork", "branch mode, same as ^b"),
+    ("/help", "keys and commands"),
+    ("/quit", "leave"),
+];
+
+/// The `/` palette: the commands still matching what is typed after the slash.
+struct Commands {
+    matches: Vec<(&'static str, &'static str)>,
+    selected: usize,
+}
+
 /// The `@` picker: where its `@` was, the walk it opened with, and the
 /// matches the query typed since selects.
 struct Files {
@@ -86,6 +101,7 @@ enum AppMode {
     Branch(Branch),
     Sessions(Sessions),
     Files(Files),
+    Commands(Commands),
 }
 
 pub struct App {
@@ -172,6 +188,17 @@ impl App {
             AppMode::Files(files) => match files.matches.is_empty() {
                 true => vec![DisplayLine::new(Tone::Notice, "no files match")],
                 false => view::picker(files.matches.clone(), files.selected),
+            },
+            AppMode::Commands(commands) => match commands.matches.is_empty() {
+                true => vec![DisplayLine::new(Tone::Notice, "no commands match")],
+                false => view::picker(
+                    commands
+                        .matches
+                        .iter()
+                        .map(|(name, blurb)| format!("{name}  {blurb}"))
+                        .collect(),
+                    commands.selected,
+                ),
             },
         }
     }
@@ -265,18 +292,18 @@ impl App {
                 self.toggle_branch_mode();
                 return;
             }
-            // The file picker is the one overlay typed into, so it takes the
-            // two keys that would otherwise walk the prompt history.
+            // The typed-into overlays take the two keys that would otherwise
+            // walk the prompt history.
             (KeyCode::Char('p'), true) => {
                 match self.mode {
-                    AppMode::Files(_) => self.move_selection(-1),
+                    AppMode::Files(_) | AppMode::Commands(_) => self.move_selection(-1),
                     _ => self.composer.recall_previous(),
                 }
                 return;
             }
             (KeyCode::Char('n'), true) => {
                 match self.mode {
-                    AppMode::Files(_) => self.move_selection(1),
+                    AppMode::Files(_) | AppMode::Commands(_) => self.move_selection(1),
                     _ => self.composer.recall_next(),
                 }
                 return;
@@ -288,6 +315,7 @@ impl App {
             AppMode::Branch(_) => self.branch_key(key),
             AppMode::Sessions(_) => self.sessions_key(key),
             AppMode::Files(_) => self.files_key(key),
+            AppMode::Commands(_) => self.commands_key(key),
         }
     }
 
@@ -316,6 +344,15 @@ impl App {
                 selected: 0,
             });
             self.filter_files();
+        }
+        // A `/` opening an empty prompt is a command coming; anywhere else it
+        // is a character.
+        if insert && key.code == KeyCode::Char('/') && !modified && self.composer.text() == "/" {
+            self.mode = AppMode::Commands(Commands {
+                matches: Vec::new(),
+                selected: 0,
+            });
+            self.filter_commands();
         }
     }
 
@@ -373,6 +410,82 @@ impl App {
                 self.filter_files();
             }
         }
+    }
+
+    /// Keys in the command palette: typing filters, Enter runs the selection,
+    /// Tab only completes it into the prompt.
+    fn commands_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.mode = AppMode::Compose,
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Enter => self.run_selected_command(),
+            KeyCode::Tab => self.complete_selected_command(),
+            _ => {
+                self.composer.key(key);
+                self.filter_commands();
+            }
+        }
+    }
+
+    /// Re-ranks the commands against what is typed after the slash. The
+    /// palette closes when the slash is gone or the line takes whitespace —
+    /// it is a name being completed, not a prompt.
+    fn filter_commands(&mut self) {
+        if !matches!(self.mode, AppMode::Commands(_)) {
+            return;
+        }
+        let text = self.composer.text();
+        let query = text
+            .strip_prefix('/')
+            .filter(|query| !query.chars().any(char::is_whitespace))
+            .map(str::to_string);
+        let Some(query) = query else {
+            self.mode = AppMode::Compose;
+            return;
+        };
+        let names: Vec<String> = COMMANDS
+            .iter()
+            .map(|(name, _)| name.trim_start_matches('/').to_string())
+            .collect();
+        let matches: Vec<(&'static str, &'static str)> = files::rank(&names, &query)
+            .iter()
+            .filter_map(|name| {
+                COMMANDS
+                    .iter()
+                    .find(|(full, _)| full.trim_start_matches('/') == name)
+                    .copied()
+            })
+            .collect();
+        let AppMode::Commands(commands) = &mut self.mode else {
+            return;
+        };
+        commands.selected = commands.selected.min(matches.len().saturating_sub(1));
+        commands.matches = matches;
+    }
+
+    /// Runs the selection as if it had been typed in full and sent. With
+    /// nothing matching, the line goes through as typed and the unknown-command
+    /// notice answers it.
+    fn run_selected_command(&mut self) {
+        let AppMode::Commands(commands) = &self.mode else {
+            return;
+        };
+        if let Some((name, _)) = commands.matches.get(commands.selected).copied() {
+            self.composer.replace_range(0, name);
+        }
+        self.mode = AppMode::Compose;
+        self.submit();
+    }
+
+    fn complete_selected_command(&mut self) {
+        let AppMode::Commands(commands) = &self.mode else {
+            return;
+        };
+        if let Some((name, _)) = commands.matches.get(commands.selected).copied() {
+            self.composer.replace_range(0, name);
+        }
+        self.mode = AppMode::Compose;
     }
 
     /// Re-ranks the walk against the query typed since the `@`. The picker
@@ -444,12 +557,14 @@ impl App {
             AppMode::Branch(_) => self.view.user_messages().len(),
             AppMode::Sessions(picker) => picker.rows.len(),
             AppMode::Files(files) => files.matches.len(),
+            AppMode::Commands(commands) => commands.matches.len(),
         };
         let selected = match &mut self.mode {
             AppMode::Compose => return,
             AppMode::Branch(branch) => &mut branch.selected,
             AppMode::Sessions(picker) => &mut picker.selected,
             AppMode::Files(files) => &mut files.selected,
+            AppMode::Commands(commands) => &mut commands.selected,
         };
         *selected = (*selected as isize + step).clamp(0, rows.saturating_sub(1) as isize) as usize;
     }
@@ -980,6 +1095,49 @@ mod tests {
                 "one".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_command_palette_filters_completes_and_runs() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut driver = driver(Vec::new(), &sessions);
+        driver.app.start(false);
+        driver.until(|d| d.app.session.is_some()).await;
+        driver.lines.clear();
+
+        // `/` alone offers every command; typing filters them.
+        typed(&mut driver.app, "/");
+        assert!(matches!(driver.app.mode, AppMode::Commands(_)));
+        assert_eq!(driver.app.overlay().len(), COMMANDS.len());
+        typed(&mut driver.app, "he");
+        let rows: Vec<String> = driver
+            .app
+            .overlay()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(rows, ["> /help  keys and commands"]);
+
+        // Enter runs the selection and clears the prompt.
+        driver.app.on_key(key(KeyCode::Enter));
+        driver.pump().await;
+        assert!(matches!(driver.app.mode, AppMode::Compose));
+        assert!(driver.app.composer.is_blank());
+        let printed: Vec<&str> = HELP.iter().copied().filter(|l| !l.is_empty()).collect();
+        assert_eq!(driver.transcript(), printed);
+
+        // Tab completes the name without running anything.
+        typed(&mut driver.app, "/re");
+        driver.app.on_key(key(KeyCode::Tab));
+        assert!(matches!(driver.app.mode, AppMode::Compose));
+        assert_eq!(driver.app.composer.text(), "/resume");
+        assert!(driver.app.take_commands().is_empty());
+        driver.app.on_key(key(KeyCode::Esc));
+
+        // A slash past the first character is a character.
+        driver.app.on_key(key(KeyCode::Char('i')));
+        typed(&mut driver.app, "a /");
+        assert!(matches!(driver.app.mode, AppMode::Compose));
     }
 
     #[tokio::test]
