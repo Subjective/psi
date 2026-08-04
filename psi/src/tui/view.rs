@@ -227,18 +227,58 @@ impl View {
         }
     }
 
-    /// The branch picker: the past messages of the active path. Which branch
-    /// the path is sits in the status row.
-    pub fn branch_lines(&self, selected: usize) -> Vec<DisplayLine> {
-        let rows = self
-            .user_messages()
-            .into_iter()
-            .map(|id| match self.item(id).map(|item| &item.payload) {
-                Some(ItemPayload::UserMessage { text }) => text.replace('\n', " "),
-                _ => String::new(),
-            })
-            .collect();
-        picker(rows, selected)
+    /// Every user message in the tree, depth-first in id order, each with how
+    /// many user messages sit above it. The branch picker shows the whole
+    /// tree, abandoned futures included, indented by that depth.
+    pub fn message_tree(&self) -> Vec<(ItemId, usize)> {
+        // Each user message hangs off its nearest user-message ancestor.
+        let mut children: HashMap<Option<ItemId>, Vec<ItemId>> = HashMap::new();
+        for item in &self.items {
+            if item.payload.kind() != ItemKind::UserMessage {
+                continue;
+            }
+            let mut cursor = item.parent_id;
+            let parent = loop {
+                match cursor.and_then(|id| self.item(id)) {
+                    Some(above) if above.payload.kind() == ItemKind::UserMessage => {
+                        break Some(above.id);
+                    }
+                    Some(above) => cursor = above.parent_id,
+                    None => break None,
+                }
+            };
+            children.entry(parent).or_default().push(item.id);
+        }
+        let mut tree = Vec::new();
+        let mut stack: Vec<(ItemId, usize)> = children
+            .get(&None)
+            .map(|roots| roots.iter().rev().map(|id| (*id, 0)).collect())
+            .unwrap_or_default();
+        while let Some((id, depth)) = stack.pop() {
+            tree.push((id, depth));
+            if let Some(kids) = children.get(&Some(id)) {
+                stack.extend(kids.iter().rev().map(|kid| (*kid, depth + 1)));
+            }
+        }
+        tree
+    }
+
+    /// The tip of the branch below an item: the newest child, followed down
+    /// until there is none. Jumping back to a branch lands here.
+    pub fn tip_of(&self, id: ItemId) -> ItemId {
+        let mut tip = id;
+        loop {
+            let next = self
+                .items
+                .iter()
+                .filter(|item| item.parent_id == Some(tip))
+                .map(|item| item.id)
+                .max();
+            match next {
+                Some(child) => tip = child,
+                None => return tip,
+            }
+        }
     }
 
     pub fn apply(&mut self, payload: &EventPayload) {
@@ -322,6 +362,9 @@ impl View {
             self.render(item, 0);
         }
         self.flush_pending();
+        // The trailing blank a finished turn leaves, so the composer keeps its
+        // distance from the reprinted branch too.
+        self.separate();
     }
 
     fn load(&mut self, snapshot: &SessionSnapshot) {
@@ -348,6 +391,7 @@ impl View {
             self.render(&item, 0);
         }
         self.flush_pending();
+        self.separate();
     }
 
     /// Hands complete lines of a streaming item to the scrollback as they
@@ -1206,6 +1250,7 @@ mod tests {
                 "> second",
                 "",
                 "two",
+                "",
             ]
         );
         assert_eq!(view.user_messages(), [ItemId(0), ItemId(2)]);
@@ -1244,19 +1289,16 @@ mod tests {
     }
 
     #[test]
-    fn the_branch_list_marks_the_selected_message() {
+    fn the_message_tree_indents_forks_and_finds_their_tips() {
         let view = forked();
-        let lines = view.branch_lines(1);
+        // Both "second"s hang off "first": the abandoned one stays visible.
         assert_eq!(
-            lines
-                .iter()
-                .map(|line| (line.tone, line.text.as_str()))
-                .collect::<Vec<_>>(),
-            [
-                (Tone::User, "  first"),
-                (Tone::Selected, "> second, revised"),
-            ]
+            view.message_tree(),
+            [(ItemId(0), 0), (ItemId(2), 1), (ItemId(4), 1)]
         );
+        // Jumping back to the abandoned branch lands on its tip.
+        assert_eq!(view.tip_of(ItemId(2)), ItemId(3));
+        assert_eq!(view.tip_of(ItemId(0)), ItemId(5));
     }
 
     #[test]
@@ -1301,7 +1343,7 @@ mod tests {
         });
         assert_eq!(
             texts(&mut view),
-            ["psi: continuing s1 (2 items)", "", "> first", "", "one"]
+            ["psi: continuing s1 (2 items)", "", "> first", "", "one", ""]
         );
     }
 }

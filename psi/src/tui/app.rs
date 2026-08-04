@@ -44,7 +44,7 @@ pub const HELP: &[&str] = &[
     "  ^p / ^n        earlier and later prompts",
     "  ^a ^e ^u ^k ^w start · end · delete to start · to end · word back",
     "  @              file picker: type to filter, enter or tab inserts",
-    "  ^b             branch mode: k/j select · enter edit · tab branch",
+    "  ^b             branch tree: type to filter · enter edit · tab jump",
     "  normal mode    i a o O x, h j k l, w b e, 0 $, dd, and counts",
     "",
     "commands:",
@@ -55,19 +55,22 @@ pub const HELP: &[&str] = &[
     "  /quit          leave",
 ];
 
-/// Where the branch picker is pointing: which past message of the active path,
-/// and which of the tree's branches that path is.
+/// The branch picker: the whole tree of user messages with their depths, and
+/// the ones still matching what has been typed.
 struct Branch {
+    query: String,
+    matches: Vec<(ItemId, usize)>,
     selected: usize,
-    leaf: usize,
 }
 
 /// `/resume`: the sessions the harness listed, newest first, each as the id
 /// that loads it and the row that names it. The rows are built when the
 /// listing arrives rather than per frame, so the ages they show are the ages
-/// at the moment the picker opened.
+/// at the moment the picker opened; `matches` is them, narrowed by the query.
 struct Sessions {
     rows: Vec<(SessionId, String)>,
+    query: String,
+    matches: Vec<(SessionId, String)>,
     selected: usize,
 }
 
@@ -177,14 +180,37 @@ impl App {
     pub fn overlay(&self) -> Vec<DisplayLine> {
         match &self.mode {
             AppMode::Compose => Vec::new(),
-            AppMode::Branch(branch) => self.view.branch_lines(branch.selected),
-            AppMode::Sessions(sessions) => match sessions.rows.is_empty() {
-                true => vec![DisplayLine::new(Tone::Notice, "no sessions yet")],
+            AppMode::Branch(branch) => match branch.matches.is_empty() {
+                true => vec![DisplayLine::new(Tone::Notice, "no messages match")],
                 false => view::picker(
-                    sessions.rows.iter().map(|(_, row)| row.clone()).collect(),
-                    sessions.selected,
+                    branch
+                        .matches
+                        .iter()
+                        .map(|(id, depth)| {
+                            let text = match self.view.item(*id).map(|item| &item.payload) {
+                                Some(ItemPayload::UserMessage { text }) => text.replace('\n', " "),
+                                _ => String::new(),
+                            };
+                            format!("{}{text}", "  ".repeat(*depth))
+                        })
+                        .collect(),
+                    branch.selected,
                 ),
             },
+            AppMode::Sessions(sessions) => {
+                match (sessions.rows.is_empty(), sessions.matches.is_empty()) {
+                    (true, _) => vec![DisplayLine::new(Tone::Notice, "no sessions yet")],
+                    (false, true) => vec![DisplayLine::new(Tone::Notice, "no sessions match")],
+                    _ => view::picker(
+                        sessions
+                            .matches
+                            .iter()
+                            .map(|(_, row)| row.clone())
+                            .collect(),
+                        sessions.selected,
+                    ),
+                }
+            }
             AppMode::Files(files) => match files.matches.is_empty() {
                 true => vec![DisplayLine::new(Tone::Notice, "no files match")],
                 false => view::picker(files.matches.clone(), files.selected),
@@ -246,6 +272,7 @@ impl App {
                             (meta.id.clone(), format!("{}  {age}", meta.id.0))
                         })
                         .collect();
+                    picker.matches = picker.rows.clone();
                     picker.selected = 0;
                 }
                 // Startup asked, to continue where the user left off. Nothing
@@ -367,6 +394,8 @@ impl App {
             "resume" => {
                 self.mode = AppMode::Sessions(Sessions {
                     rows: Vec::new(),
+                    query: String::new(),
+                    matches: Vec::new(),
                     selected: 0,
                 });
                 self.outbox.push(Command::ListSessions);
@@ -384,14 +413,43 @@ impl App {
         }
     }
 
+    /// Keys in the session picker: typing filters — like every typed picker,
+    /// selection is arrows and ^p/^n, since letters belong to the query.
     fn sessions_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
             KeyCode::Enter => self.load_selected_session(),
             KeyCode::Esc => self.mode = AppMode::Compose,
+            KeyCode::Backspace => {
+                if let AppMode::Sessions(picker) = &mut self.mode {
+                    picker.query.pop();
+                }
+                self.filter_sessions();
+            }
+            KeyCode::Char(typed) => {
+                if let AppMode::Sessions(picker) = &mut self.mode {
+                    picker.query.push(typed);
+                }
+                self.filter_sessions();
+            }
             _ => {}
         }
+    }
+
+    /// Narrows the rows to subsequence matches of the query, keeping their
+    /// newest-first order: typing filters, it does not re-rank.
+    fn filter_sessions(&mut self) {
+        let AppMode::Sessions(picker) = &mut self.mode else {
+            return;
+        };
+        picker.matches = picker
+            .rows
+            .iter()
+            .filter(|(_, row)| files::score(&picker.query, row).is_some())
+            .cloned()
+            .collect();
+        picker.selected = picker.selected.min(picker.matches.len().saturating_sub(1));
     }
 
     /// Keys in the file picker. Everything the picker does not claim is typing,
@@ -528,7 +586,7 @@ impl App {
         let AppMode::Sessions(picker) = &self.mode else {
             return;
         };
-        let Some((session_id, _)) = picker.rows.get(picker.selected) else {
+        let Some((session_id, _)) = picker.matches.get(picker.selected) else {
             return;
         };
         self.outbox.push(Command::LoadSession {
@@ -537,24 +595,57 @@ impl App {
         self.mode = AppMode::Compose;
     }
 
+    /// Keys in the branch tree: typing filters, Enter edits the selection to
+    /// fork, Tab jumps to the branch it is on.
     fn branch_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Tab => self.switch_branch(1),
-            KeyCode::BackTab => self.switch_branch(-1),
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Tab => self.jump_to_selected(),
             KeyCode::Enter => self.fork(),
             KeyCode::Esc => self.mode = AppMode::Compose,
+            KeyCode::Backspace => {
+                if let AppMode::Branch(branch) = &mut self.mode {
+                    branch.query.pop();
+                }
+                self.filter_branch();
+            }
+            KeyCode::Char(typed) => {
+                if let AppMode::Branch(branch) = &mut self.mode {
+                    branch.query.push(typed);
+                }
+                self.filter_branch();
+            }
             _ => {}
         }
+    }
+
+    /// Narrows the tree to subsequence matches of the query, keeping its
+    /// depth-first order and each match's own indent.
+    fn filter_branch(&mut self) {
+        let tree = self.view.message_tree();
+        let AppMode::Branch(branch) = &mut self.mode else {
+            return;
+        };
+        branch.matches = tree
+            .into_iter()
+            .filter(|(id, _)| {
+                let text = match self.view.item(*id).map(|item| &item.payload) {
+                    Some(ItemPayload::UserMessage { text }) => text.as_str(),
+                    _ => "",
+                };
+                files::score(&branch.query, text).is_some()
+            })
+            .collect();
+        branch.selected = branch.selected.min(branch.matches.len().saturating_sub(1));
     }
 
     /// Moves the open overlay's selection, clamped to its rows.
     fn move_selection(&mut self, step: isize) {
         let rows = match &self.mode {
             AppMode::Compose => return,
-            AppMode::Branch(_) => self.view.user_messages().len(),
-            AppMode::Sessions(picker) => picker.rows.len(),
+            AppMode::Branch(branch) => branch.matches.len(),
+            AppMode::Sessions(picker) => picker.matches.len(),
             AppMode::Files(files) => files.matches.len(),
             AppMode::Commands(commands) => commands.matches.len(),
         };
@@ -578,35 +669,34 @@ impl App {
         if self.view.running() || self.view.user_messages().is_empty() {
             return;
         }
-        let leaves = self.view.leaves();
-        let leaf = leaves
-            .iter()
-            .position(|id| Some(*id) == self.view.head())
+        let matches = self.view.message_tree();
+        // Open pointing at the active path's newest message.
+        let selected = self
+            .view
+            .user_messages()
+            .last()
+            .and_then(|at| matches.iter().position(|(id, _)| id == at))
             .unwrap_or(0);
         self.mode = AppMode::Branch(Branch {
-            selected: self.view.user_messages().len() - 1,
-            leaf,
+            query: String::new(),
+            matches,
+            selected,
         });
     }
 
-    /// Moves the head to another branch tip. The whole branch is reprinted,
-    /// because terminal scrollback only ever grows.
-    fn switch_branch(&mut self, step: isize) {
-        let leaves = self.view.leaves();
-        if leaves.len() < 2 {
-            return;
-        }
-        let AppMode::Branch(branch) = &mut self.mode else {
+    /// Moves the head to the tip of the branch the selection is on — how an
+    /// abandoned future comes back. The branch reprints, because terminal
+    /// scrollback only ever grows.
+    fn jump_to_selected(&mut self) {
+        let AppMode::Branch(branch) = &self.mode else {
             return;
         };
-        let count = leaves.len() as isize;
-        branch.leaf = ((branch.leaf as isize + step).rem_euclid(count)) as usize;
-        let leaf = leaves[branch.leaf];
-        self.set_head(Some(leaf));
-        let selected = self.view.user_messages().len().saturating_sub(1);
-        if let AppMode::Branch(branch) = &mut self.mode {
-            branch.selected = selected;
-        }
+        let Some((id, _)) = branch.matches.get(branch.selected).copied() else {
+            return;
+        };
+        let tip = self.view.tip_of(id);
+        self.set_head(Some(tip));
+        self.mode = AppMode::Compose;
     }
 
     /// Editing a past message is `set_head` to the item before it followed by a
@@ -616,8 +706,7 @@ impl App {
         let AppMode::Branch(branch) = &self.mode else {
             return;
         };
-        let messages = self.view.user_messages();
-        let Some(id) = messages.get(branch.selected).copied() else {
+        let Some((id, _)) = branch.matches.get(branch.selected).copied() else {
             return;
         };
         let Some(item) = self.view.item(id) else {
@@ -940,9 +1029,11 @@ mod tests {
         // the status row says about it.
         assert_eq!(driver.app.status(), "branch 2/2");
 
-        // Tab switches back to the cancelled branch, which reprints it.
+        // The tree opens on the active path's newest message; the cancelled
+        // branch's message sits one row up. Tab jumps back to it, reprinting.
         driver.lines.clear();
         driver.app.on_key(ctrl('b'));
+        driver.app.on_key(key(KeyCode::Up));
         driver.app.on_key(key(KeyCode::Tab));
         driver.pump().await;
         assert_eq!(
@@ -1082,7 +1173,7 @@ mod tests {
         // Each row is the id that loads it and how long ago it started.
         assert_eq!(rows[1], format!("  {}  just now", first.0));
 
-        driver.app.on_key(key(KeyCode::Char('j')));
+        driver.app.on_key(key(KeyCode::Down));
         driver.app.on_key(key(KeyCode::Enter));
         driver.until(|d| d.app.session == Some(first.clone())).await;
         assert!(matches!(driver.app.mode, AppMode::Compose));
