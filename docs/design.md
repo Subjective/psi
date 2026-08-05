@@ -173,7 +173,7 @@ Speculative tool execution depends on tool semantics and agent state, so it live
 
 ### Open questions
 
-- Whether Ratatui's inline rendering is sufficient or a custom line-diff renderer is needed.
+- Whether Ratatui's inline rendering is sufficient or a custom line-diff renderer is needed. The first constraint found: an inline viewport's height is fixed when the terminal is built, so the viewport is a constant few rows holding only what is still changing, and every line that becomes final is pushed above it into scrollback.
 - Which open models have reliable enough tool calling to serve as the predictor.
 - How much provider-specific data must be retained to replay reasoning-model turns correctly.
 - Whether branch navigation should temporarily enter fullscreen mode.
