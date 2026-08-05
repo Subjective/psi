@@ -429,6 +429,7 @@ mod tests {
             workspace: PathBuf::from("/fixture"),
             sessions_dir: sessions.path().to_path_buf(),
             trace: None,
+            speculation: None,
         })
         .unwrap();
         Driver {

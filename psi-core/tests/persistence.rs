@@ -36,6 +36,7 @@ fn spawn_with(sessions: &Path, model: FakeModel, tools: ToolRegistry) -> Client 
         workspace: PathBuf::from("/fixture"),
         sessions_dir: sessions.to_path_buf(),
         trace: None,
+        speculation: None,
     })
     .unwrap()
 }
