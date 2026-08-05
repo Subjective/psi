@@ -12,7 +12,8 @@ pub mod openai;
 pub mod protocol;
 pub mod responses;
 pub mod session;
+pub mod store;
 pub mod tool;
 pub mod tools;
 
-pub use engine::Harness;
+pub use engine::{Harness, HarnessConfig};
