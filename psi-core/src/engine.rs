@@ -10,8 +10,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
+use crate::hook::{HookDecision, HookRegistry};
 use crate::item::{CompletionStatus, ItemId, ItemKind, ItemPayload, TurnId, WorkspaceRevision};
-use crate::model::{ModelBackend, ModelEvent, ToolCallRequest, TurnRequest};
+use crate::model::{ModelBackend, ModelEvent, ToolCallRequest, TurnRequest, Usage};
 use crate::protocol::{Command, Event, EventPayload};
 use crate::session::{Session, SessionId};
 use crate::tool::{ToolEffect, ToolFuture, ToolInvocation, ToolOutput, ToolRegistry};
@@ -20,10 +21,12 @@ pub struct Harness;
 
 impl Harness {
     /// Spawns the engine task and returns the command/event channel pair —
-    /// the in-process form of the interface protocol.
+    /// the in-process form of the interface protocol. Hooks are registered
+    /// here and nowhere else.
     pub fn spawn(
         model: Arc<dyn ModelBackend>,
         tools: ToolRegistry,
+        hooks: HookRegistry,
         workspace: PathBuf,
     ) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>) {
         let (command_tx, command_rx) = mpsc::channel(64);
@@ -31,6 +34,7 @@ impl Harness {
         let engine = Engine {
             model,
             tools,
+            hooks,
             workspace,
             revision: WorkspaceRevision(0),
             sessions: HashMap::new(),
@@ -86,6 +90,8 @@ struct OpenItem {
     id: ItemId,
     kind: StreamedKind,
     buffer: String,
+    /// Set from `ReasoningCompleted` just before the item closes.
+    provider_data: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -94,9 +100,26 @@ enum StreamedKind {
     Reasoning,
 }
 
+/// A tool call whose arguments are still streaming: `item_started` and
+/// argument deltas already emitted under a reserved id, appended when the call
+/// completes.
+struct OpenCall {
+    id: ItemId,
+    call_id: String,
+    tool: String,
+}
+
+/// How a turn ended, as reported on `turn_finished`.
+struct TurnOutcome {
+    status: CompletionStatus,
+    error: Option<String>,
+    usage: Option<Usage>,
+}
+
 struct Engine {
     model: Arc<dyn ModelBackend>,
     tools: ToolRegistry,
+    hooks: HookRegistry,
     workspace: PathBuf,
     /// One harness serves one workspace, so one revision counter is shared by
     /// every session.
@@ -195,13 +218,14 @@ impl Engine {
         self.emit(&session_id, EventPayload::ItemFinished { item })
             .await;
 
-        let (status, error) = self.turn_loop(&session_id, &mut session, turn_id).await;
+        let outcome = self.turn_loop(&session_id, &mut session, turn_id).await;
         self.emit(
             &session_id,
             EventPayload::TurnFinished {
                 turn_id,
-                status,
-                error,
+                status: outcome.status,
+                error: outcome.error,
+                usage: outcome.usage,
             },
         )
         .await;
@@ -215,7 +239,8 @@ impl Engine {
         session_id: &SessionId,
         session: &mut Session,
         turn_id: TurnId,
-    ) -> (CompletionStatus, Option<String>) {
+    ) -> TurnOutcome {
+        let mut usage: Option<Usage> = None;
         loop {
             let request = TurnRequest {
                 session_id: session_id.clone(),
@@ -225,6 +250,7 @@ impl Engine {
             let mut stream = self.model.stream_response(request);
 
             let mut open: Option<OpenItem> = None;
+            let mut open_call: Option<OpenCall> = None;
             let mut calls: Vec<ToolCallRequest> = Vec::new();
 
             let end = loop {
@@ -259,6 +285,94 @@ impl Engine {
                         )
                         .await;
                     }
+                    Wake::Model(Some(ModelEvent::ReasoningCompleted { provider_data })) => {
+                        // Reasoning that streams no text still has to become an
+                        // item: the provider data is what makes the turn
+                        // replayable.
+                        if !matches!(&open, Some(item) if item.kind == StreamedKind::Reasoning) {
+                            self.close_open(
+                                session_id,
+                                session,
+                                turn_id,
+                                open.take(),
+                                CompletionStatus::Completed,
+                                None,
+                            )
+                            .await;
+                            let id = session.reserve_item_id();
+                            self.emit(
+                                session_id,
+                                EventPayload::ItemStarted {
+                                    item_id: id,
+                                    kind: ItemKind::Reasoning,
+                                },
+                            )
+                            .await;
+                            open = Some(OpenItem {
+                                id,
+                                kind: StreamedKind::Reasoning,
+                                buffer: String::new(),
+                                provider_data: None,
+                            });
+                        }
+                        if let Some(item) = open.as_mut() {
+                            item.provider_data = Some(provider_data);
+                        }
+                        self.close_open(
+                            session_id,
+                            session,
+                            turn_id,
+                            open.take(),
+                            CompletionStatus::Completed,
+                            None,
+                        )
+                        .await;
+                    }
+                    Wake::Model(Some(ModelEvent::ToolCallArgumentsDelta {
+                        call_id,
+                        tool,
+                        delta,
+                    })) => {
+                        let item_id = match &open_call {
+                            Some(open) if open.call_id == call_id => open.id,
+                            _ => {
+                                self.close_open(
+                                    session_id,
+                                    session,
+                                    turn_id,
+                                    open.take(),
+                                    CompletionStatus::Completed,
+                                    None,
+                                )
+                                .await;
+                                self.close_open_call(
+                                    session_id,
+                                    session,
+                                    turn_id,
+                                    open_call.take(),
+                                    CompletionStatus::Failed,
+                                    Some("the model started another call first".to_string()),
+                                )
+                                .await;
+                                let id = session.reserve_item_id();
+                                self.emit(
+                                    session_id,
+                                    EventPayload::ItemStarted {
+                                        item_id: id,
+                                        kind: ItemKind::ToolCall,
+                                    },
+                                )
+                                .await;
+                                open_call = Some(OpenCall { id, call_id, tool });
+                                id
+                            }
+                        };
+                        self.emit(session_id, EventPayload::ItemDelta { item_id, delta })
+                            .await;
+                    }
+                    Wake::Model(Some(ModelEvent::Usage { usage: reported })) => {
+                        usage.get_or_insert_default().add(reported);
+                    }
                     Wake::Model(Some(ModelEvent::ToolCallCompleted { call })) => {
                         self.close_open(
                             session_id,
@@ -269,15 +383,31 @@ impl Engine {
                             None,
                         )
                         .await;
-                        let id = session.reserve_item_id();
-                        self.emit(
-                            session_id,
-                            EventPayload::ItemStarted {
-                                item_id: id,
-                                kind: ItemKind::ToolCall,
-                            },
-                        )
-                        .await;
+                        // The item already exists when the arguments streamed.
+                        let id = match open_call.take() {
+                            Some(open) if open.call_id == call.call_id => open.id,
+                            stale => {
+                                self.close_open_call(
+                                    session_id,
+                                    session,
+                                    turn_id,
+                                    stale,
+                                    CompletionStatus::Failed,
+                                    Some("the model completed another call first".to_string()),
+                                )
+                                .await;
+                                let id = session.reserve_item_id();
+                                self.emit(
+                                    session_id,
+                                    EventPayload::ItemStarted {
+                                        item_id: id,
+                                        kind: ItemKind::ToolCall,
+                                    },
+                                )
+                                .await;
+                                id
+                            }
+                        };
                         let payload = ItemPayload::ToolCall {
                             tool: call.tool.clone(),
                             call_id: call.call_id.clone(),
@@ -299,90 +429,82 @@ impl Engine {
                             .await;
                         calls.push(call);
                     }
-                    Wake::Model(Some(ModelEvent::Completed)) => {
-                        self.close_open(
-                            session_id,
-                            session,
-                            turn_id,
-                            open.take(),
-                            CompletionStatus::Completed,
-                            None,
-                        )
-                        .await;
-                        break RoundEnd::Completed;
-                    }
+                    Wake::Model(Some(ModelEvent::Completed)) => break RoundEnd::Completed,
                     Wake::Model(Some(ModelEvent::Error { message })) => {
-                        self.close_open(
-                            session_id,
-                            session,
-                            turn_id,
-                            open.take(),
-                            CompletionStatus::Failed,
-                            Some(message.clone()),
-                        )
-                        .await;
                         break RoundEnd::Failed(message);
                     }
                     Wake::Model(None) => {
                         // The backend hung up without Completed or Error;
                         // silence is never success.
-                        let message = "model stream ended without completing".to_string();
-                        self.close_open(
-                            session_id,
-                            session,
-                            turn_id,
-                            open.take(),
-                            CompletionStatus::Failed,
-                            Some(message.clone()),
-                        )
-                        .await;
-                        break RoundEnd::Failed(message);
+                        break RoundEnd::Failed(
+                            "model stream ended without completing".to_string(),
+                        );
                     }
                     Wake::Command(Some(Command::CancelTurn { session_id: target }))
                         if target == *session_id =>
                     {
-                        self.close_open(
-                            session_id,
-                            session,
-                            turn_id,
-                            open.take(),
-                            CompletionStatus::Cancelled,
-                            None,
-                        )
-                        .await;
                         break RoundEnd::Cancelled;
                     }
                     Wake::Command(Some(other)) => self.deferred.push_back(other),
-                    Wake::Command(None) => {
-                        // Every client hung up; treat as cancellation.
-                        self.close_open(
-                            session_id,
-                            session,
-                            turn_id,
-                            open.take(),
-                            CompletionStatus::Cancelled,
-                            None,
-                        )
-                        .await;
-                        break RoundEnd::Cancelled;
-                    }
+                    // Every client hung up; treat as cancellation.
+                    Wake::Command(None) => break RoundEnd::Cancelled,
                 }
             };
+
+            let (status, error) = match &end {
+                RoundEnd::Completed => (CompletionStatus::Completed, None),
+                RoundEnd::Cancelled => (CompletionStatus::Cancelled, None),
+                RoundEnd::Failed(message) => (CompletionStatus::Failed, Some(message.clone())),
+            };
+            self.close_open(session_id, session, turn_id, open.take(), status, error)
+                .await;
+            // A response that ends mid-arguments leaves a call that can never
+            // run: it is recorded so its `item_started` closes, and dropped
+            // from the request the codec builds next.
+            let (status, error) = match &end {
+                RoundEnd::Cancelled => (CompletionStatus::Cancelled, None),
+                RoundEnd::Failed(message) => (CompletionStatus::Failed, Some(message.clone())),
+                RoundEnd::Completed => (
+                    CompletionStatus::Failed,
+                    Some("the response completed before the arguments did".to_string()),
+                ),
+            };
+            self.close_open_call(
+                session_id,
+                session,
+                turn_id,
+                open_call.take(),
+                status,
+                error,
+            )
+            .await;
 
             match end {
                 RoundEnd::Failed(message) => {
                     self.settle_unexecuted_calls(session_id, session, turn_id, &calls)
                         .await;
-                    return (CompletionStatus::Failed, Some(message));
+                    return TurnOutcome {
+                        status: CompletionStatus::Failed,
+                        error: Some(message),
+                        usage,
+                    };
                 }
                 RoundEnd::Cancelled => {
                     self.settle_unexecuted_calls(session_id, session, turn_id, &calls)
                         .await;
-                    return (CompletionStatus::Cancelled, None);
+                    return TurnOutcome {
+                        status: CompletionStatus::Cancelled,
+                        error: None,
+                        usage,
+                    };
                 }
                 RoundEnd::Completed => {
                     if calls.is_empty() {
-                        return (CompletionStatus::Completed, None);
+                        return TurnOutcome {
+                            status: CompletionStatus::Completed,
+                            error: None,
+                            usage,
+                        };
                     }
                     let mut remaining = calls.into_iter();
                     while let Some(call) = remaining.next() {
@@ -391,7 +513,11 @@ impl Engine {
                             let rest: Vec<_> = remaining.collect();
                             self.settle_unexecuted_calls(session_id, session, turn_id, &rest)
                                 .await;
-                            return (CompletionStatus::Cancelled, None);
+                            return TurnOutcome {
+                                status: CompletionStatus::Cancelled,
+                                error: None,
+                                usage,
+                            };
                         }
                     }
                     // All calls executed; ask the model for its next response.
@@ -420,23 +546,35 @@ impl Engine {
         .await;
         let started = Instant::now();
 
-        let (effect, mut future): (ToolEffect, ToolFuture) = match self.tools.get(&call.tool) {
-            Some(tool) => (
-                tool.effect(),
-                tool.execute(ToolInvocation {
-                    call_id: call.call_id.clone(),
-                    arguments: call.arguments.clone(),
-                    cwd: self.workspace.clone(),
-                }),
-            ),
-            None => {
-                let message = format!("unknown tool: {}", call.tool);
+        let invocation = ToolInvocation {
+            call_id: call.call_id.clone(),
+            arguments: call.arguments.clone(),
+            cwd: self.workspace.clone(),
+        };
+        // A blocked call and an unknown tool both answer the model without
+        // running anything, so neither can have mutated: they declare
+        // themselves read-only and the revision stands. `ran` marks the case
+        // where a tool really executed, which is what after-hooks observe.
+        let refusal = match self.hooks.before(&call.tool, &invocation) {
+            HookDecision::Block { reason } => Some(format!("{} refused: {reason}", call.tool)),
+            HookDecision::Continue if self.tools.get(&call.tool).is_none() => {
+                Some(format!("unknown tool: {}", call.tool))
+            }
+            HookDecision::Continue => None,
+        };
+        let ran = refusal.is_none();
+        let (effect, mut future): (ToolEffect, ToolFuture) = match refusal {
+            Some(message) => {
                 let output = ToolOutput {
                     content: message.clone(),
                     error: Some(message),
                     truncated: false,
                 };
                 (ToolEffect::ReadOnly, Box::pin(async move { output }))
+            }
+            None => {
+                let tool = self.tools.get(&call.tool).expect("checked above");
+                (tool.effect(), tool.execute(invocation.clone()))
             }
         };
 
@@ -464,6 +602,9 @@ impl Engine {
 
         match output {
             Some(output) => {
+                if ran {
+                    self.hooks.after(&call.tool, &invocation, &output);
+                }
                 let status = if output.error.is_none() {
                     CompletionStatus::Completed
                 } else {
@@ -613,6 +754,7 @@ impl Engine {
                     id,
                     kind,
                     buffer: delta,
+                    provider_data: None,
                 });
             }
         }
@@ -632,10 +774,40 @@ impl Engine {
         let Some(open) = open else { return };
         let payload = match open.kind {
             StreamedKind::AssistantMessage => ItemPayload::AssistantMessage { text: open.buffer },
-            StreamedKind::Reasoning => ItemPayload::Reasoning { text: open.buffer },
+            StreamedKind::Reasoning => ItemPayload::Reasoning {
+                text: open.buffer,
+                provider_data: open.provider_data,
+            },
         };
         let item = session
             .append(open.id, turn_id, payload, status, error, now_ms())
+            .clone();
+        self.emit(session_id, EventPayload::ItemFinished { item })
+            .await;
+    }
+
+    /// Appends a tool call whose arguments never finished streaming, so its
+    /// `item_started` closes. The call never runs, and the codec drops calls
+    /// with no result when it replays history.
+    async fn close_open_call(
+        &mut self,
+        session_id: &SessionId,
+        session: &mut Session,
+        turn_id: TurnId,
+        open_call: Option<OpenCall>,
+        status: CompletionStatus,
+        error: Option<String>,
+    ) {
+        let Some(open_call) = open_call else { return };
+        let payload = ItemPayload::ToolCall {
+            tool: open_call.tool,
+            call_id: open_call.call_id,
+            arguments: serde_json::Value::Null,
+            cwd: self.workspace.clone(),
+            revision: self.revision,
+        };
+        let item = session
+            .append(open_call.id, turn_id, payload, status, error, now_ms())
             .clone();
         self.emit(session_id, EventPayload::ItemFinished { item })
             .await;

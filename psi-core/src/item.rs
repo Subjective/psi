@@ -64,6 +64,12 @@ pub enum ItemPayload {
     },
     Reasoning {
         text: String,
+        /// The provider's own record of this reasoning, replayed verbatim so a
+        /// reasoning model sees its own encrypted reasoning again. Opaque: the
+        /// harness never reads inside it. `None` when the backend has nothing
+        /// to replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_data: Option<serde_json::Value>,
     },
     ToolCall {
         tool: String,

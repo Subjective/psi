@@ -2,3 +2,7 @@
 name = "psi"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+psi-core = { path = "../psi-core" }
+tokio = { workspace = true }

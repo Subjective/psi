@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use psi_core::Harness;
 use psi_core::fake::{FakeModel, FakeResponse, FakeTool};
+use psi_core::hook::HookRegistry;
 use psi_core::item::{CompletionStatus, ItemId, ItemPayload, TurnId};
 use psi_core::model::{ModelEvent, ToolCallRequest};
 use psi_core::protocol::{Command, Event, EventPayload};
@@ -142,7 +143,12 @@ async fn golden_fake_turn_event_sequence() {
         ToolEffect::ReadOnly,
         "fake file contents",
     ));
-    let (commands, mut events) = Harness::spawn(Arc::new(model), tools, PathBuf::from("/fixture"));
+    let (commands, mut events) = Harness::spawn(
+        Arc::new(model),
+        tools,
+        HookRegistry::new(),
+        PathBuf::from("/fixture"),
+    );
 
     let session_id = create_session(&commands, &mut events).await;
     let turn = submit_and_collect(&commands, &mut events, &session_id, "Read the readme").await;
@@ -184,7 +190,7 @@ async fn golden_fake_turn_event_sequence() {
         other => panic!("expected user_message, got {other:?}"),
     }
     match &snap.items[1].payload {
-        ItemPayload::Reasoning { text } => assert_eq!(text, "Let me read that file."),
+        ItemPayload::Reasoning { text, .. } => assert_eq!(text, "Let me read that file."),
         other => panic!("expected reasoning, got {other:?}"),
     }
     match &snap.items[2].payload {
@@ -222,6 +228,7 @@ async fn set_head_forks_the_item_tree() {
     let (commands, mut events) = Harness::spawn(
         Arc::new(model),
         ToolRegistry::new(),
+        HookRegistry::new(),
         PathBuf::from("/fixture"),
     );
     let session_id = create_session(&commands, &mut events).await;
@@ -265,6 +272,7 @@ async fn cancel_turn_preserves_partial_output() {
     let (commands, mut events) = Harness::spawn(
         Arc::new(model),
         ToolRegistry::new(),
+        HookRegistry::new(),
         PathBuf::from("/fixture"),
     );
     let session_id = create_session(&commands, &mut events).await;
@@ -333,7 +341,12 @@ async fn workspace_revision_bumps_after_exec() {
         ToolEffect::ReadOnly,
         "contents",
     ));
-    let (commands, mut events) = Harness::spawn(Arc::new(model), tools, PathBuf::from("/fixture"));
+    let (commands, mut events) = Harness::spawn(
+        Arc::new(model),
+        tools,
+        HookRegistry::new(),
+        PathBuf::from("/fixture"),
+    );
     let session_id = create_session(&commands, &mut events).await;
 
     submit_and_collect(&commands, &mut events, &session_id, "touch then read").await;

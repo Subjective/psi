@@ -5,10 +5,14 @@
 
 pub mod engine;
 pub mod fake;
+pub mod hook;
 pub mod item;
 pub mod model;
+pub mod openai;
 pub mod protocol;
+pub mod responses;
 pub mod session;
 pub mod tool;
+pub mod tools;
 
 pub use engine::Harness;
