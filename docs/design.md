@@ -163,6 +163,22 @@ A Chat Completions fallback exists only as a predictor-side config switch, for m
 
 Session history is immutable; compaction never rewrites it. Compaction produces a derived context checkpoint (a portable summary plus a recent tail) used when building model requests. Checkpoints live in session metadata, not as items, and are invalidated when `head` leaves the compacted path. Provider-side compaction (OpenAI `/responses/compact`) is an optional experiment behind a capability flag. Out of MVP scope; scheduled in Milestone 8, before long-session benchmarks.
 
+### Traces: one JSONL file per measured run
+
+A trace is the durable record of one benchmark run, and the only thing a baseline measures. The harness writes it as it emits events, so a trace is an assembly of the event stream rather than a second accounting of the same run: a record per turn boundary and per finished item, each carrying the event's sequence number and timestamp. The benchmark runner adds the two records the event stream cannot know — a header naming the task and the trial, and a terminator carrying whether the run met the task's success criterion. A trace that lacks the terminator is refused rather than measured, because a partial measurement reported as a whole one is a wrong number.
+
+A run reconstructs from its trace: the item sequence (identical to the session's own log), turn boundaries and timings, every tool call with its arguments and duration, statuses, and usage. Everything a report prints — per-turn wall time, the split between model time and tool time, per-tool latency, tokens, success — is derived from that, which is what lets a baseline be recomputed from stored artifacts and what makes the Milestone 6 comparison meaningful. Milestone 6's speculation records join the same file as further record types on the same clock and sequence space.
+
+Traces are run artifacts, not sessions: they live beside the fixture workspaces and session logs of the benchmark run that produced them, never in the user's sessions directory.
+
+### Benchmark tasks and injected latency
+
+A task is a fixture workspace, a scripted model, and a success criterion, defined in Rust rather than a data format — a data format would have to grow a language for the script and the criterion, and a benchmark run varies neither. Tasks run against the real tool profile, so their tools really read and really patch the fixture and success is a claim about the world.
+
+Fixture tools are far faster than real ones, so every tool is wrapped in injected latency drawn from a lognormal fitted to a measured median and p95: across 670 real Codex sessions the active-tool median is around 40ms with a p95 near 2s, which is the heavy tail speculation has to hide. Draws come from a per-tool seeded stream, so the nth call to a tool takes the same time in every trial and repeated trials measure the same run. Model generation time is simulated as a fixed per-response delay, because most of a turn's wall time is the model and that is the time speculation uses.
+
+The runner is a binary of `psi-core`, not of `psi`: a baseline is a development tool and does not ship with the agent.
+
 ### Speculation is optional middleware
 
 The baseline agent loop works without speculation. Speculation observes a turn, executes allowlisted predicted calls, and reconciles them when the authoritative call arrives. v0 speculates only read-only tools at a fixed workspace revision; writes remain authoritative.

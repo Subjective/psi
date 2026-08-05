@@ -14,6 +14,11 @@ use crate::tool::{Tool, ToolEffect, ToolFuture, ToolInvocation, ToolOutput, Tool
 pub struct FakeResponse {
     pub events: Vec<ModelEvent>,
     pub hang: bool,
+    /// Wall time the response spends before it streams anything, standing in
+    /// for generation time. Zero unless a benchmark sets it (`crate::bench`):
+    /// most of a real turn is the model generating, and a baseline with none
+    /// of that time in it would not resemble one.
+    pub delay_ms: u64,
 }
 
 impl FakeResponse {
@@ -21,11 +26,21 @@ impl FakeResponse {
         Self {
             events,
             hang: false,
+            delay_ms: 0,
         }
     }
 
     pub fn hanging(events: Vec<ModelEvent>) -> Self {
-        Self { events, hang: true }
+        Self {
+            events,
+            hang: true,
+            delay_ms: 0,
+        }
+    }
+
+    pub fn delayed(mut self, delay_ms: u64) -> Self {
+        self.delay_ms = delay_ms;
+        self
     }
 }
 
@@ -56,6 +71,9 @@ impl ModelBackend for FakeModel {
                     .await;
                 return;
             };
+            if response.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(response.delay_ms)).await;
+            }
             for event in response.events {
                 if tx.send(event).await.is_err() {
                     return;

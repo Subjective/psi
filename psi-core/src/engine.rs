@@ -17,6 +17,7 @@ use crate::protocol::{Command, Event, EventPayload};
 use crate::session::{Session, SessionId};
 use crate::store::SessionStore;
 use crate::tool::{ToolEffect, ToolFuture, ToolInvocation, ToolOutput, ToolRegistry};
+use crate::trace::TraceWriter;
 
 /// Everything the engine needs to run. A struct rather than arguments because
 /// `workspace` and `sessions_dir` are two paths that must not be swapped.
@@ -28,6 +29,11 @@ pub struct HarnessConfig {
     pub workspace: PathBuf,
     /// Where session logs live; created if missing.
     pub sessions_dir: PathBuf,
+    /// Where this run's trace is written. `Some` only for a measured run: the
+    /// Milestone 5 baselines are the consumer, and Milestone 6's speculation
+    /// records will be stamped from the same sequence counter into the same
+    /// file. Interactive Psi passes `None`.
+    pub trace: Option<TraceWriter>,
 }
 
 pub struct Harness;
@@ -56,6 +62,7 @@ impl Harness {
             events: EventSink {
                 tx: event_tx,
                 next_seq: 0,
+                trace: config.trace,
             },
         };
         tokio::spawn(engine.run());
@@ -73,17 +80,25 @@ fn now_ms() -> u64 {
 struct EventSink {
     tx: mpsc::Sender<Event>,
     next_seq: u64,
+    trace: Option<TraceWriter>,
 }
 
 impl EventSink {
     async fn emit(&mut self, session_id: Option<SessionId>, payload: EventPayload) {
+        let seq = self.next_seq;
+        let timestamp_ms = now_ms();
+        self.next_seq += 1;
+        // The trace record is written before the event goes out, so a client
+        // that has seen `turn_finished` can read a trace that already holds it.
+        if let Some(trace) = &self.trace {
+            trace.record_event(seq, timestamp_ms, &payload);
+        }
         let event = Event {
-            seq: self.next_seq,
-            timestamp_ms: now_ms(),
+            seq,
+            timestamp_ms,
             session_id,
             payload,
         };
-        self.next_seq += 1;
         // A dropped receiver means no client is listening; the engine keeps going.
         let _ = self.tx.send(event).await;
     }
