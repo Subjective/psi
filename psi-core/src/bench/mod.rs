@@ -1,9 +1,13 @@
-//! Non-speculative baselines (docs/design.md, Milestone 5). A benchmark runs
-//! a deterministic task — a fixture workspace, a scripted model, the real
-//! five-tool profile with injected latency — writes one trace per trial, and
-//! reports the trials by reading those traces back. Nothing measured comes
-//! from anywhere but the traces, which is what makes a baseline reproducible
-//! from its artifacts and what Milestone 6 will be compared against.
+//! Benchmarks (docs/design.md, Milestones 5 to 7). A benchmark runs a
+//! deterministic task — a fixture workspace, a scripted model, a real tool
+//! profile with injected latency — writes one trace per trial, and reports the
+//! trials by reading those traces back. Nothing measured comes from anywhere
+//! but the traces, which is what makes a run reproducible from its artifacts.
+//!
+//! A run either speculates or does not, and a speculating one names its
+//! strategy and its two budgets. The authoritative model stays scripted in
+//! every case, so a comparison between two runs varies the predictor and
+//! nothing else.
 //!
 //! This module and its `psi-bench` binary are the dev-side surface: the `psi`
 //! binary is a different package, so nothing here ships with it.
@@ -15,7 +19,7 @@ mod task;
 
 pub use latency::{Latency, LatencyProfile, LatencyStream, inject_latency};
 pub use oracle::ReplayOracle;
-pub use report::{SpeculationStats, Stats, TaskReport, ToolStats};
+pub use report::{Comparison, SpeculationStats, Stats, TaskReport, ToolStats};
 pub use task::{BenchTask, tasks};
 
 use std::path::{Path, PathBuf};
@@ -24,14 +28,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
-use crate::fake::FakeModel;
+use crate::fake::{FakeModel, FakeResponse};
 use crate::hook::HookRegistry;
 use crate::item::{CompletionStatus, ItemPayload};
+use crate::model::ModelBackend;
+use crate::predictor::{BranchSampling, DirectProposal};
 use crate::protocol::{Command, Event, EventPayload};
 use crate::session::SessionId;
-use crate::speculation::{SpeculationConfig, v0_allowlist};
-use crate::tools::default_profile;
+use crate::speculation::{Predictor, SpeculationConfig, v0_allowlist};
 use crate::trace::{RunTrace, TraceRecord, TraceWriter};
+use crate::vllm::{VllmBackend, VllmConfig};
 use crate::{Harness, HarnessConfig};
 
 /// How a benchmark run is timed. Latency is the independent variable of the
@@ -46,9 +52,8 @@ pub struct BenchConfig {
     /// nothing to measure against. The default puts a task near that split
     /// against the default tool profile.
     pub model_delay_ms: u64,
-    /// `Some(execution budget)` drives the run with the replay oracle over the
-    /// v0 allowlist — the perfect-prediction ceiling. `None` is the baseline.
-    pub speculate: Option<usize>,
+    /// How the run predicts. `None` is the non-speculative baseline.
+    pub speculate: Option<Speculation>,
 }
 
 impl Default for BenchConfig {
@@ -60,6 +65,36 @@ impl Default for BenchConfig {
             speculate: None,
         }
     }
+}
+
+/// How a speculating run guesses. The strategy is per-run configuration, and
+/// the two budgets are the research question's independent variables: fixing
+/// both is what makes the strategies comparable, because branch sampling
+/// spends far more predictor tokens per guess than direct proposal (docs/
+/// design.md, "Speculation").
+#[derive(Debug, Clone)]
+pub struct Speculation {
+    pub strategy: Strategy,
+    /// Predictor tokens one round may spend guessing.
+    pub prediction_budget: u64,
+    /// Concurrent speculative calls per round — the fanout.
+    pub execution_budget: usize,
+}
+
+/// Which predictor drives a run. The two real strategies carry the vLLM target
+/// they ask; the oracle asks nothing.
+#[derive(Debug, Clone)]
+pub enum Strategy {
+    /// The replay oracle: always right and free, so its run is the ceiling a
+    /// real strategy is measured against.
+    Oracle,
+    /// One predictor request for the calls the assistant will make next.
+    Direct { predictor: VllmConfig },
+    /// `samples` temperature-sampled continuations, ranked by agreement.
+    Branch {
+        predictor: VllmConfig,
+        samples: usize,
+    },
 }
 
 /// Runs repeated trials of one task and reports them from their traces.
@@ -101,16 +136,18 @@ pub async fn run_trial(
         .into_iter()
         .map(|response| response.delayed(config.model_delay_ms))
         .collect();
-    // The oracle reads the same script the model plays, so its guesses are
-    // exactly the recording's next calls.
-    let speculation = config.speculate.map(|execution_budget| SpeculationConfig {
-        predictor: Arc::new(ReplayOracle::for_script(&script)),
-        allowlist: v0_allowlist(),
-        execution_budget,
-    });
+    let speculation = match &config.speculate {
+        Some(speculate) => Some(SpeculationConfig {
+            predictor: predictor(&speculate.strategy, &script, &workspace)?,
+            allowlist: v0_allowlist(),
+            prediction_budget: speculate.prediction_budget,
+            execution_budget: speculate.execution_budget,
+        }),
+        None => None,
+    };
     let (commands, mut events) = Harness::spawn(HarnessConfig {
         model: Arc::new(FakeModel::new(script)),
-        tools: inject_latency(default_profile(workspace.clone()), &config.latency),
+        tools: inject_latency((task.profile)(workspace.clone()), &config.latency),
         hooks: HookRegistry::new(),
         workspace: workspace.clone(),
         sessions_dir: dir.join("sessions"),
@@ -130,6 +167,42 @@ pub async fn run_trial(
     let success = completed && (task.success)(&workspace, &answers);
     trace.write(&TraceRecord::Outcome { success })?;
     Ok(path)
+}
+
+/// Builds the run's predictor. The oracle reads the same script the model
+/// plays, so its guesses are exactly the recording's next calls; the two real
+/// strategies read a vLLM target instead.
+fn predictor(
+    strategy: &Strategy,
+    script: &[FakeResponse],
+    workspace: &Path,
+) -> std::io::Result<Arc<dyn Predictor>> {
+    Ok(match strategy {
+        Strategy::Oracle => Arc::new(ReplayOracle::for_script(script)),
+        Strategy::Direct { predictor } => {
+            Arc::new(DirectProposal::new(backend(predictor, workspace)?))
+        }
+        Strategy::Branch { predictor, samples } => Arc::new(BranchSampling::new(
+            backend(predictor, workspace)?,
+            *samples,
+        )),
+    })
+}
+
+/// The predictor's model target. Its instructions name the fixture workspace,
+/// because a benchmark's authoritative model is a recording that needs no such
+/// help while the predictor has to guess real paths inside a directory whose
+/// name changes every trial.
+fn backend(config: &VllmConfig, workspace: &Path) -> std::io::Result<Arc<dyn ModelBackend>> {
+    let mut config = config.clone();
+    config.instructions = format!(
+        "{}\n\nThe workspace root is {}.",
+        config.instructions,
+        workspace.display()
+    );
+    VllmBackend::new(config)
+        .map(|backend| Arc::new(backend) as Arc<dyn ModelBackend>)
+        .map_err(std::io::Error::other)
 }
 
 /// Writes a task's fixture into an empty directory, replacing whatever an

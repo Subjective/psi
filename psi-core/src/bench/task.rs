@@ -1,16 +1,25 @@
-//! The benchmark tasks. A task is a fixture workspace, a scripted model, and
-//! a success criterion, written as Rust values rather than a data format: a
-//! data format would have to grow a language for the model script and the
-//! criterion, and neither is something a benchmark run varies.
+//! The benchmark tasks. A task is a fixture workspace, a tool profile, a
+//! scripted model, and a success criterion, written as Rust values rather than
+//! a data format: a data format would have to grow a language for the model
+//! script and the criterion, and neither is something a benchmark run varies.
 //!
-//! Both tasks run against the real five-tool profile, so a task's tools really
-//! read and really patch the fixture and its success criterion is a claim
-//! about the world, not about the script.
+//! Every task runs against a real tool profile, so a task's tools really read
+//! and really patch the fixture and its success criterion is a claim about the
+//! world, not about the script.
+//!
+//! `read_and_answer` and `read_and_answer_shell` are the same work asked twice:
+//! once of the default profile and once of the shell-minimal one. Comparing
+//! their speculation stats is the experiment docs/design.md schedules — whether
+//! the structured read-only tools earn their schema cost.
+
+use std::path::PathBuf;
 
 use serde_json::json;
 
 use crate::fake::FakeResponse;
 use crate::model::{ModelEvent, ToolCallRequest, Usage};
+use crate::tool::ToolRegistry;
+use crate::tools::{default_profile, shell_minimal_profile};
 
 /// One deterministic benchmark task.
 pub struct BenchTask {
@@ -18,6 +27,9 @@ pub struct BenchTask {
     /// Written into a fresh workspace before every trial, as `(path,
     /// contents)`.
     pub fixture: &'static [(&'static str, &'static str)],
+    /// The tools this task advertises, built over the trial's workspace. The
+    /// agent and the predictor share it.
+    pub profile: fn(PathBuf) -> ToolRegistry,
     /// One user message per turn.
     pub prompts: &'static [&'static str],
     /// The model's responses, in order, across every turn of the task.
@@ -33,10 +45,11 @@ pub fn tasks() -> &'static [BenchTask] {
     &TASKS
 }
 
-static TASKS: [BenchTask; 2] = [
+static TASKS: [BenchTask; 3] = [
     BenchTask {
         name: "fix_and_test",
         fixture: FIX_AND_TEST_FIXTURE,
+        profile: default_profile,
         prompts: &["make the test pass"],
         script: fix_and_test_script,
         success: fix_and_test_success,
@@ -44,11 +57,23 @@ static TASKS: [BenchTask; 2] = [
     BenchTask {
         name: "read_and_answer",
         fixture: READ_AND_ANSWER_FIXTURE,
+        profile: default_profile,
         prompts: &[
             "which module owns the retry budget?",
             "how many retries does it allow?",
         ],
         script: read_and_answer_script,
+        success: read_and_answer_success,
+    },
+    BenchTask {
+        name: "read_and_answer_shell",
+        fixture: READ_AND_ANSWER_FIXTURE,
+        profile: shell_minimal_profile,
+        prompts: &[
+            "which module owns the retry budget?",
+            "how many retries does it allow?",
+        ],
+        script: read_and_answer_shell_script,
         success: read_and_answer_success,
     },
 ];
@@ -158,6 +183,53 @@ fn read_and_answer_script() -> Vec<FakeResponse> {
         ),
         response(
             call("search", "call-4", json!({ "pattern": "max_retries" })),
+            2_100,
+        ),
+        FakeResponse::new(vec![
+            ModelEvent::TextDelta {
+                delta: "It allows 3 retries.".into(),
+            },
+            usage(2_300, 70),
+            ModelEvent::Completed,
+        ]),
+    ]
+}
+
+/// The same two questions answered through the shell-minimal profile: the
+/// searches become `exec` calls, which speculation may not run and which bump
+/// the workspace revision out from under whatever it did run, so only the two
+/// reads are still speculable.
+fn read_and_answer_shell_script() -> Vec<FakeResponse> {
+    vec![
+        response(
+            call(
+                "exec",
+                "call-1",
+                json!({ "command": "grep -rn RetryBudget ." }),
+            ),
+            1_100,
+        ),
+        response(
+            call("read_file", "call-2", json!({ "path": "src/budget.rs" })),
+            1_300,
+        ),
+        FakeResponse::new(vec![
+            ModelEvent::TextDelta {
+                delta: "src/budget.rs owns the retry budget.".into(),
+            },
+            usage(1_500, 80),
+            ModelEvent::Completed,
+        ]),
+        response(
+            call("read_file", "call-3", json!({ "path": "src/budget.rs" })),
+            1_900,
+        ),
+        response(
+            call(
+                "exec",
+                "call-4",
+                json!({ "command": "grep -rn max_retries ." }),
+            ),
             2_100,
         ),
         FakeResponse::new(vec![

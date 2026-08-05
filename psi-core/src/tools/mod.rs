@@ -40,6 +40,21 @@ pub fn default_profile(workspace: PathBuf) -> ToolRegistry {
     registry
 }
 
+/// The shell-minimal profile: the planned experiment in docs/design.md, "Five
+/// tools, one profile" — whether the structured read-only tools earn their
+/// schema cost through speculative coverage. Listing and searching go through
+/// `exec` here, which is neither on the speculative allowlist nor declared
+/// read-only, so the work the default profile speculates is work this profile
+/// cannot.
+pub fn shell_minimal_profile(workspace: PathBuf) -> ToolRegistry {
+    let root = path::canonical_root(workspace);
+    let mut registry = ToolRegistry::new();
+    registry.register(ReadFile::new(root.clone()));
+    registry.register(ApplyPatch::new(root.clone()));
+    registry.register(Exec::new(root));
+    registry
+}
+
 /// Parses the model's arguments into a tool's own shape. Unknown fields are
 /// rejected: the argument space is exactly the advertised schema, which is
 /// what makes two calls with the same arguments the same call.

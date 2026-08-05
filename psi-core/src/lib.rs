@@ -4,12 +4,14 @@
 //! `docs/design.md` is the authoritative design.
 
 pub mod bench;
+pub mod chat;
 pub mod engine;
 pub mod fake;
 pub mod hook;
 pub mod item;
 pub mod model;
 pub mod openai;
+pub mod predictor;
 pub mod protocol;
 pub mod responses;
 pub mod session;

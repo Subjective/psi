@@ -8,7 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use psi_core::bench::{BenchConfig, Latency, ReplayOracle, SpeculationStats, run_trial, tasks};
+use psi_core::bench::{
+    BenchConfig, Latency, ReplayOracle, Speculation, SpeculationStats, Strategy, run_trial, tasks,
+};
 use psi_core::fake::{FakeModel, FakeResponse};
 use psi_core::hook::{Hook, HookDecision, HookRegistry};
 use psi_core::item::{CompletionStatus, ItemPayload};
@@ -63,6 +65,9 @@ fn spawn(
         speculation: predictor.map(|predictor| SpeculationConfig {
             predictor,
             allowlist: v0_allowlist(),
+            // The oracle reads a recording rather than a model, so no budget
+            // it is handed changes what it guesses.
+            prediction_budget: 0,
             execution_budget: 2,
         }),
     })
@@ -204,7 +209,11 @@ async fn oracle_run_beats_the_baseline_and_hits_every_call() {
     let baseline = RunTrace::read(&baseline_path).unwrap();
 
     let mut speculated_config = config.clone();
-    speculated_config.speculate = Some(4);
+    speculated_config.speculate = Some(Speculation {
+        strategy: Strategy::Oracle,
+        prediction_budget: 0,
+        execution_budget: 4,
+    });
     let speculated_path = run_trial(task, 0, &speculated_config, &dir.path().join("speculated"))
         .await
         .unwrap();

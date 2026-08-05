@@ -74,6 +74,14 @@ pub enum TraceRecord {
         timestamp_ms: u64,
         turn_id: TurnId,
         calls: Vec<PredictedCall>,
+        /// Tokens the predictor spent on this round. The report sums these
+        /// into predictor cost, the price the hit rate has to earn back; the
+        /// replay oracle spends none.
+        usage: Usage,
+        /// Why the round came back short, when it did. The report prints these
+        /// so a run whose predictor is failing does not read as one whose
+        /// predictor is merely wrong.
+        error: Option<String>,
     },
     /// One guess the runtime started executing: allowlisted, uncached,
     /// unblocked, and within the execution budget.

@@ -94,7 +94,11 @@ Most of a turn's wall time is the authoritative model generating its next respon
 
 A prediction is just a guessed tool call. The prediction strategy — direct proposal or branch sampling — is per-run configuration, not per-prediction metadata. Each strategy hands the runtime an ordered, deduplicated list of calls; the runtime keeps those that pass the read-only allowlist and are not already cached, and executes the first few.
 
-Two configuration numbers bound each round of speculation (one round per authoritative model response), and they are the independent variables of the research question: the prediction budget (predictor tokens spent guessing) and the execution budget (concurrent speculative calls — the fanout). Fixing both is what makes the strategies comparable, because branch sampling spends far more predictor tokens per guess than direct proposal. The core metrics are hit rate (the fraction of authoritative calls served from the cache) and net latency change.
+Direct proposal asks the predictor once, over the same context and the same tool profile the agent was given plus an instruction to call what the assistant is about to call; the predictor's own order is the ranking. Branch sampling asks for nothing extra: it samples the predictor continuing the turn itself and keeps the tool calls each continuation makes, ranking them by how many samples propose the same call. Its samples go out as separate concurrent requests, because vLLM's `/v1/responses` has no `n` — the server batches the requests together and its prefix cache serves the shared prompt to the ones behind the first, so the prefix is shared through the cache rather than through one forked sequence, and every sample bills its own input tokens. Nothing is shared with the authoritative model, which is a different model answering a different request.
+
+Two configuration numbers bound each round of speculation (one round per authoritative model response), and they are the independent variables of the research question: the prediction budget (predictor tokens spent guessing) and the execution budget (concurrent speculative calls — the fanout). Fixing both is what makes the strategies comparable, because branch sampling spends far more predictor tokens per guess than direct proposal. The prediction budget caps generated tokens: direct proposal spends it on its one request and branch sampling divides it across its samples, so a round of either generates the same at most, and what a round really billed is recorded on its prediction so a report can price the guessing. The core metrics are hit rate (the fraction of authoritative calls served from the cache) and net latency change.
+
+A predictor never fails a turn. A prediction request that fails, times out, or answers with nothing usable is a missed round — zero proposals, recorded with the reason, so a misconfigured predictor does not read as one that merely guesses badly.
 
 The replay oracle is a fake predictor used only in tests. Replaying a recorded session against a fixture workspace, it "predicts" exactly the call the recording makes next, so it is always right. It measures the ceiling — the savings available when prediction is perfect — which tells us whether speculation can pay at all before any real predictor exists.
 
@@ -136,7 +140,7 @@ Default tools: `read_file`, `list_directory`, `search`, `apply_patch`, `exec`.
 
 Structured read-only tools exist because they are the unit of speculation: canonical arguments, declared effects, cache keys, and per-tool latency stats. `exec` is the general escape hatch. The registry may hold more tools than the active profile; only the profile is advertised to the model, and the agent and predictor always share the same profile so their calls are comparable.
 
-The v0 speculative allowlist is `read_file`, `list_directory`, `search`. A planned experiment: a shell-minimal profile (`read_file`, `apply_patch`, `exec`) to measure whether structured tools earn their schema cost through speculative coverage.
+The v0 speculative allowlist is `read_file`, `list_directory`, `search`. A profile is a property of a benchmark task, so the shell-minimal experiment is a second task doing the first one's work: a profile of `read_file`, `apply_patch`, `exec`, with listing and searching pushed into `exec`, which is neither allowlisted nor read-only. Comparing the two tasks' speculative coverage measures whether structured tools earn their schema cost.
 
 ### Trusted environment and hooks
 
@@ -155,9 +159,9 @@ The internal model boundary stays provider-neutral. Behind it, both backends spe
 
 The two backends share a wire format, not a capability set. Each configured model target carries a capability descriptor for the differences Psi branches on — encrypted-reasoning replay (OpenAI only; vLLM rejects it) and provider-side compaction — plus per-target quirks (reasoning-effort semantics, `tool_choice` breadth, stream-terminating error events) recorded as they are found. The features vLLM's Responses path lacks (`store`, `previous_response_id`, compaction) are features Psi does not depend on: Psi owns history and sends stateless requests, and provider-side storage is never authoritative.
 
-Two required guards: a vLLM response that returns zero tool calls when tools were supplied is a configuration error (a missing tool parser fails silently), and vLLM cancellation is a connection drop, not the cancel endpoint.
+Two required guards: a vLLM response that returns zero tool calls when tools were supplied is a configuration error (a missing tool parser fails silently), and vLLM cancellation is a connection drop, not the cancel endpoint. The first guard latches per target, so a predictor that proposes nothing before it has ever proposed anything is reported the same way. That is the ambiguity the guard names rather than a misfire: the prediction is empty under either reading, the reason lands on the round, and the first call the predictor proposes settles the target for good.
 
-A Chat Completions fallback exists only as a predictor-side config switch, for model-parser combinations whose streaming misbehaves under Responses.
+A Chat Completions fallback exists only as a predictor-side config switch, for model-parser combinations whose streaming misbehaves under Responses. It is non-streaming, because the predictor cannot rank or deduplicate anything until the whole proposal has arrived, and it asks for parallel tool calls, because vLLM truncates a Chat reply to its first tool call when they are refused and a proposal capped at one call is not a proposal.
 
 ### Compaction
 

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use crate::item::WorkspaceRevision;
-use crate::model::{ToolCallRequest, TurnRequest};
+use crate::model::{ToolCallRequest, TurnRequest, Usage};
 use crate::tool::ToolOutput;
 
 /// The v0 speculative allowlist: the read-only structured tools (docs/
@@ -37,13 +37,31 @@ pub fn v0_allowlist() -> Vec<String> {
 /// now being generated. The request is exactly the authoritative request —
 /// agent and predictor share the tool profile, so their calls are comparable.
 ///
-/// The prediction budget (predictor tokens spent guessing) binds here when the
-/// real strategies arrive in Milestone 7; the replay oracle spends none.
+/// `budget` is the prediction budget: the predictor tokens this round may
+/// spend guessing, the first of the research question's two independent
+/// variables. A strategy caps its own requests by it, which is what lets two
+/// strategies be compared under one number; the replay oracle spends none.
 pub trait Predictor: Send + Sync {
-    fn predict(&self, request: &TurnRequest) -> PredictionFuture;
+    fn predict(&self, request: &TurnRequest, budget: u64) -> PredictionFuture;
 }
 
-pub type PredictionFuture = Pin<Box<dyn Future<Output = Vec<ToolCallRequest>> + Send>>;
+pub type PredictionFuture = Pin<Box<dyn Future<Output = Prediction> + Send>>;
+
+/// One round of guessing.
+#[derive(Debug, Clone, Default)]
+pub struct Prediction {
+    /// Ordered and deduplicated; the runtime executes the first few that pass
+    /// selection.
+    pub calls: Vec<ToolCallRequest>,
+    /// What the predictor's own requests billed, which the report sums into
+    /// predictor cost (`crate::bench::SpeculationStats`).
+    pub usage: Usage,
+    /// Why a round came back short, when it did. A predictor that fails, times
+    /// out, or answers with nothing usable yields an empty prediction rather
+    /// than a failed turn, so without this a misconfigured predictor is
+    /// indistinguishable from one that simply guesses badly.
+    pub error: Option<String>,
+}
 
 /// Speculation switched on: who guesses, what may run, and how wide.
 pub struct SpeculationConfig {
@@ -51,9 +69,13 @@ pub struct SpeculationConfig {
     /// Tools speculation may execute. v0 is the read-only structured tools;
     /// writes remain authoritative.
     pub allowlist: Vec<String>,
-    /// Concurrent speculative executions per round — the fanout, one of the
-    /// research question's two independent variables. The runtime executes the
-    /// first `execution_budget` guesses that pass selection.
+    /// Predictor tokens one round may spend guessing — the first of the
+    /// research question's two independent variables, handed to the predictor
+    /// on every round.
+    pub prediction_budget: u64,
+    /// Concurrent speculative executions per round — the fanout, the second
+    /// variable. The runtime executes the first `execution_budget` guesses that
+    /// pass selection.
     pub execution_budget: usize,
 }
 
@@ -144,6 +166,10 @@ impl SpeculationRuntime {
 
     pub fn predictor(&self) -> &Arc<dyn Predictor> {
         &self.config.predictor
+    }
+
+    pub fn prediction_budget(&self) -> u64 {
+        self.config.prediction_budget
     }
 
     pub fn execution_budget(&self) -> usize {
