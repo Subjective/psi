@@ -74,15 +74,18 @@ const MOTIONS: &[(char, Motion, Scope)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operator {
     Delete,
+    Change,
 }
 
-/// `[count] operator`. Doubling the key (`dd`) applies it linewise.
-const OPERATORS: &[(char, Operator)] = &[('d', Operator::Delete)];
+/// `[count] operator`. Doubling the key (`dd`, `cc`) applies it linewise.
+const OPERATORS: &[(char, Operator)] = &[('d', Operator::Delete), ('c', Operator::Change)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     InsertBefore,
     InsertAfter,
+    InsertAtLineStart,
+    InsertAtLineEnd,
     OpenBelow,
     OpenAbove,
     DeleteChar,
@@ -110,6 +113,8 @@ const READLINE: &[(char, Readline)] = &[
 const ACTIONS: &[(char, Action)] = &[
     ('i', Action::InsertBefore),
     ('a', Action::InsertAfter),
+    ('I', Action::InsertAtLineStart),
+    ('A', Action::InsertAtLineEnd),
     ('o', Action::OpenBelow),
     ('O', Action::OpenAbove),
     ('x', Action::DeleteChar),
@@ -377,13 +382,18 @@ impl Composer {
             .map(|(_, op)| *op)
         {
             match self.pending.operator {
-                // The doubled key (`dd`) is the grammar's linewise form.
+                // A doubled operator (`dd`, `cc`) is its linewise form.
                 Some(pending) if pending == operator => {
                     let count = self.pending.operator_count * self.pending.count.unwrap_or(1);
                     self.pending = Pending::default();
-                    self.delete_lines(self.text.char_to_line(self.cursor), count);
+                    let first = self.text.char_to_line(self.cursor);
+                    match operator {
+                        Operator::Delete => self.delete_lines(first, count),
+                        Operator::Change => self.change_lines(first, count),
+                    }
                 }
-                _ => {
+                Some(_) => self.pending = Pending::default(),
+                None => {
                     self.pending.operator = Some(operator);
                     self.pending.operator_count = self.pending.count.take().unwrap_or(1);
                 }
@@ -453,6 +463,21 @@ impl Composer {
                 self.mode = Mode::Insert;
                 self.cursor = (self.cursor + 1).min(end);
             }
+            Action::InsertAtLineStart => {
+                let (start, end) = self.line_bounds_at();
+                self.mode = Mode::Insert;
+                self.cursor = self
+                    .text
+                    .slice(start..end)
+                    .chars()
+                    .position(|character| !character.is_whitespace())
+                    .map_or(end, |offset| start + offset);
+            }
+            Action::InsertAtLineEnd => {
+                let (_, end) = self.line_bounds_at();
+                self.mode = Mode::Insert;
+                self.cursor = end;
+            }
             Action::OpenBelow => {
                 let (_, end) = self.line_bounds_at();
                 self.text.insert_char(end, '\n');
@@ -478,7 +503,18 @@ impl Composer {
     }
 
     fn operate(&mut self, operator: Operator, motion: Motion, scope: Scope, count: usize) {
-        let Operator::Delete = operator;
+        // Vim defines `cw` as `ce` when it starts on a nonblank character. It
+        // changes the word itself while leaving the following whitespace in
+        // place, which is what makes replacement text read naturally.
+        let (motion, scope) = if operator == Operator::Change
+            && motion == Motion::WordForward
+            && self.cursor < self.text.len_chars()
+            && class(self.text.char(self.cursor)) != Class::Blank
+        {
+            (Motion::WordEnd, Scope::Inclusive)
+        } else {
+            (motion, scope)
+        };
         let mut target = self.target(motion, count);
         // Vim's one exception to `w`: under an operator it stops at the end of
         // a line rather than joining that line to the next.
@@ -495,7 +531,12 @@ impl Composer {
             Scope::Linewise => {
                 let from = self.text.char_to_line(self.cursor);
                 let to = self.text.char_to_line(target);
-                self.delete_lines(from.min(to), to.abs_diff(from) + 1);
+                let first = from.min(to);
+                let count = to.abs_diff(from) + 1;
+                match operator {
+                    Operator::Delete => self.delete_lines(first, count),
+                    Operator::Change => self.change_lines(first, count),
+                }
             }
             Scope::Exclusive | Scope::Inclusive => {
                 let (start, mut end) = (self.cursor.min(target), self.cursor.max(target));
@@ -507,12 +548,33 @@ impl Composer {
                 }
                 if end > start {
                     self.text.remove(start..end);
+                    if operator == Operator::Change {
+                        self.mode = Mode::Insert;
+                    }
                 }
                 self.cursor = start;
                 self.clamp();
             }
         }
         self.column_intent = self.cursor().1;
+    }
+
+    /// Replaces one or more whole lines with a single editable line. When
+    /// lines follow the changed range, its newline is inserted explicitly;
+    /// changing the tail already leaves an empty final line behind.
+    fn change_lines(&mut self, first: usize, count: usize) {
+        let last = (first + count).min(self.text.len_lines());
+        let followed = last < self.text.len_lines();
+        let start = self.text.line_to_char(first);
+        let end = self.text.line_to_char(last);
+        self.text.remove(start..end);
+        if followed {
+            self.text.insert_char(start, '\n');
+        }
+        self.cursor = start;
+        self.mode = Mode::Insert;
+        self.clamp();
+        self.column_intent = 0;
     }
 
     fn delete_lines(&mut self, first: usize, count: usize) {
@@ -904,6 +966,33 @@ mod tests {
     }
 
     #[test]
+    fn change_with_a_motion_deletes_then_enters_insert_mode() {
+        let mut composer = fresh();
+        composer.paste("alpha beta gamma");
+        escape(&mut composer);
+        typed(&mut composer, "0cw");
+        assert_eq!(
+            state(&composer),
+            (" beta gamma".into(), (0, 0), Mode::Insert)
+        );
+
+        typed(&mut composer, "new");
+        assert_eq!(
+            state(&composer),
+            ("new beta gamma".into(), (0, 3), Mode::Insert)
+        );
+    }
+
+    #[test]
+    fn change_counts_multiply_on_both_sides_of_the_operator() {
+        let mut composer = fresh();
+        composer.paste("one two three four five");
+        escape(&mut composer);
+        typed(&mut composer, "02c2w");
+        assert_eq!(state(&composer), (" five".into(), (0, 0), Mode::Insert));
+    }
+
+    #[test]
     fn counts_on_both_sides_of_an_operator_multiply() {
         let mut composer = fresh();
         composer.paste("one two three four five six");
@@ -925,6 +1014,39 @@ mod tests {
         assert_eq!(state(&composer), ("four".into(), (0, 0), Mode::Normal));
         typed(&mut composer, "dd");
         assert_eq!(state(&composer), ("".into(), (0, 0), Mode::Normal));
+    }
+
+    #[test]
+    fn cc_replaces_counted_lines_with_one_editable_line() {
+        let mut composer = fresh();
+        composer.paste("one\ntwo\nthree\nfour");
+        escape(&mut composer);
+        typed(&mut composer, "kkk2cc");
+        assert_eq!(
+            state(&composer),
+            ("\nthree\nfour".into(), (0, 0), Mode::Insert)
+        );
+
+        typed(&mut composer, "new");
+        assert_eq!(
+            state(&composer),
+            ("new\nthree\nfour".into(), (0, 3), Mode::Insert)
+        );
+    }
+
+    #[test]
+    fn a_linewise_motion_makes_change_linewise() {
+        let mut composer = fresh();
+        composer.paste("one\ntwo\nthree");
+        escape(&mut composer);
+        typed(&mut composer, "kkcj");
+        assert_eq!(state(&composer), ("\nthree".into(), (0, 0), Mode::Insert));
+
+        let mut composer = fresh();
+        composer.paste("one\ntwo");
+        escape(&mut composer);
+        typed(&mut composer, "cc");
+        assert_eq!(state(&composer), ("one\n".into(), (1, 0), Mode::Insert));
     }
 
     #[test]
@@ -958,6 +1080,31 @@ mod tests {
             state(&composer),
             ("ab!\ntop\nline".into(), (1, 3), Mode::Insert)
         );
+    }
+
+    #[test]
+    fn shift_i_and_shift_a_insert_at_the_lines_text_boundaries() {
+        let mut composer = fresh();
+        composer.paste("  alpha  ");
+        escape(&mut composer);
+        typed(&mut composer, "IX");
+        assert_eq!(
+            state(&composer),
+            ("  Xalpha  ".into(), (0, 3), Mode::Insert)
+        );
+
+        escape(&mut composer);
+        typed(&mut composer, "AY");
+        assert_eq!(
+            state(&composer),
+            ("  Xalpha  Y".into(), (0, 11), Mode::Insert)
+        );
+
+        let mut composer = fresh();
+        composer.paste("   ");
+        escape(&mut composer);
+        typed(&mut composer, "IX");
+        assert_eq!(state(&composer), ("   X".into(), (0, 4), Mode::Insert));
     }
 
     #[test]
@@ -1041,5 +1188,13 @@ mod tests {
         // `2z` is not a command: the count must not carry into the `w`.
         typed(&mut composer, "2zw");
         assert_eq!(composer.cursor(), (0, 4));
+
+        // Two different operators are not a command, and neither one carries
+        // forward to the motion that follows them.
+        typed(&mut composer, "0dcw");
+        assert_eq!(
+            state(&composer),
+            ("one two three".into(), (0, 4), Mode::Normal)
+        );
     }
 }
