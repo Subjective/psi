@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["psi-core", "psi"]
 
+[workspace.package]
+rust-version = "1.88"
+
 [workspace.dependencies]
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
