@@ -505,17 +505,24 @@ impl Composer {
     fn operate(&mut self, operator: Operator, motion: Motion, scope: Scope, count: usize) {
         // Vim defines `cw` as `ce` when it starts on a nonblank character. It
         // changes the word itself while leaving the following whitespace in
-        // place, which is what makes replacement text read naturally.
-        let (motion, scope) = if operator == Operator::Change
+        // place, which is what makes replacement text read naturally. Unlike a
+        // plain `e`, its first stop is the end of the word under the cursor
+        // even when the cursor already sits there, so `cw` never crosses the
+        // following whitespace — or the line break — into the next word.
+        let change_word = operator == Operator::Change
             && motion == Motion::WordForward
             && self.cursor < self.text.len_chars()
-            && class(self.text.char(self.cursor)) != Class::Blank
-        {
+            && class(self.text.char(self.cursor)) != Class::Blank;
+        let (motion, scope) = if change_word {
             (Motion::WordEnd, Scope::Inclusive)
         } else {
             (motion, scope)
         };
-        let mut target = self.target(motion, count);
+        let mut target = if change_word {
+            self.change_word_target(count)
+        } else {
+            self.target(motion, count)
+        };
         // Vim's one exception to `w`: under an operator it stops at the end of
         // a line rather than joining that line to the next.
         if motion == Motion::WordForward && target > self.cursor {
@@ -548,9 +555,11 @@ impl Composer {
                 }
                 if end > start {
                     self.text.remove(start..end);
-                    if operator == Operator::Change {
-                        self.mode = Mode::Insert;
-                    }
+                }
+                // A change enters Insert mode even when its motion covered
+                // nothing — `c$` on an empty line — as Vim does.
+                if operator == Operator::Change {
+                    self.mode = Mode::Insert;
                 }
                 self.cursor = start;
                 self.clamp();
@@ -662,25 +671,45 @@ impl Composer {
                 }
                 at
             }
-            Motion::WordEnd => {
-                let mut at = self.cursor;
-                for _ in 0..count {
-                    if at + 1 >= len {
-                        break;
-                    }
-                    at += 1;
-                    while at < len && class(self.text.char(at)) == Class::Blank {
-                        at += 1;
-                    }
-                    if at < len {
-                        let from = class(self.text.char(at));
-                        while at + 1 < len && class(self.text.char(at + 1)) == from {
-                            at += 1;
-                        }
-                    }
-                }
-                at.min(len.saturating_sub(1))
+            Motion::WordEnd => self.word_end(self.cursor, count),
+        }
+    }
+
+    /// Where `count` repeats of `e` land, starting from `from`.
+    fn word_end(&self, from: usize, count: usize) -> usize {
+        let len = self.text.len_chars();
+        let mut at = from;
+        for _ in 0..count {
+            if at + 1 >= len {
+                break;
             }
+            at += 1;
+            while at < len && class(self.text.char(at)) == Class::Blank {
+                at += 1;
+            }
+            if at < len {
+                let run = class(self.text.char(at));
+                while at + 1 < len && class(self.text.char(at + 1)) == run {
+                    at += 1;
+                }
+            }
+        }
+        at.min(len.saturating_sub(1))
+    }
+
+    /// Where `cw` ends: the end of the word under the cursor — the cursor
+    /// itself when it already sits there, which Vim counts as the first end —
+    /// then a plain `e` for each count beyond the first.
+    fn change_word_target(&self, count: usize) -> usize {
+        let mut at = self.cursor;
+        while at + 1 < self.text.len_chars()
+            && class(self.text.char(at + 1)) == class(self.text.char(at))
+        {
+            at += 1;
+        }
+        match count {
+            0 | 1 => at,
+            _ => self.word_end(at, count - 1),
         }
     }
 
@@ -980,6 +1009,73 @@ mod tests {
         assert_eq!(
             state(&composer),
             ("new beta gamma".into(), (0, 3), Mode::Insert)
+        );
+    }
+
+    /// On a word's last character, `cw` changes only up to the end of that
+    /// word — the character itself — never the whitespace or word after it.
+    /// The expectations here are what headless Neovim reports.
+    #[test]
+    fn cw_at_a_word_end_stays_inside_the_word() {
+        let mut composer = fresh();
+        composer.paste("one two");
+        escape(&mut composer);
+        typed(&mut composer, "0ecw");
+        assert_eq!(state(&composer), ("on two".into(), (0, 2), Mode::Insert));
+
+        // A single-character word is its own end.
+        let mut composer = fresh();
+        composer.paste("a b");
+        escape(&mut composer);
+        typed(&mut composer, "0cw");
+        assert_eq!(state(&composer), (" b".into(), (0, 0), Mode::Insert));
+
+        // So is a punctuation run's.
+        let mut composer = fresh();
+        composer.paste("one, two");
+        escape(&mut composer);
+        typed(&mut composer, "0eecw");
+        assert_eq!(state(&composer), ("one two".into(), (0, 3), Mode::Insert));
+    }
+
+    #[test]
+    fn cw_at_a_line_end_never_joins_the_next_line() {
+        let mut composer = fresh();
+        composer.paste("one\ntwo");
+        escape(&mut composer);
+        typed(&mut composer, "k0ecw");
+        assert_eq!(state(&composer), ("on\ntwo".into(), (0, 2), Mode::Insert));
+    }
+
+    /// `2cw` from a word's last character counts that end as the first of the
+    /// two, as Vim does.
+    #[test]
+    fn a_counted_cw_takes_the_current_end_as_its_first() {
+        let mut composer = fresh();
+        composer.paste("one two three");
+        escape(&mut composer);
+        typed(&mut composer, "0e2cw");
+        assert_eq!(state(&composer), ("on three".into(), (0, 2), Mode::Insert));
+    }
+
+    /// `c$` on an empty line has nothing to remove but still starts the edit,
+    /// as Vim's does.
+    #[test]
+    fn a_change_covering_nothing_still_enters_insert_mode() {
+        let mut composer = fresh();
+        composer.paste("one\n\ntwo");
+        escape(&mut composer);
+        typed(&mut composer, "k");
+        typed(&mut composer, "c$");
+        assert_eq!(
+            state(&composer),
+            ("one\n\ntwo".into(), (1, 0), Mode::Insert)
+        );
+
+        typed(&mut composer, "X");
+        assert_eq!(
+            state(&composer),
+            ("one\nX\ntwo".into(), (1, 1), Mode::Insert)
         );
     }
 
