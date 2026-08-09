@@ -142,10 +142,10 @@ impl Session {
     /// Moves head to any existing item, or to `None` (before the first item).
     /// This is the branch primitive: submitting afterwards forks the tree.
     pub fn set_head(&mut self, head: Option<ItemId>) -> Result<(), UnknownItem> {
-        if let Some(id) = head {
-            if !self.index.contains_key(&id) {
-                return Err(UnknownItem(id));
-            }
+        if let Some(id) = head
+            && !self.index.contains_key(&id)
+        {
+            return Err(UnknownItem(id));
         }
         self.head = head;
         // An appended item records its own head move, so only this one needs a

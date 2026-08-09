@@ -414,7 +414,8 @@ async fn a_failing_predictor_misses_rounds_instead_of_failing_turns() {
         "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 5\r\n\r\noops!".to_string(),
     ])
     .await;
-    let task = tasks()
+    let bench_tasks = tasks();
+    let task = bench_tasks
         .iter()
         .find(|task| task.name == "read_and_answer")
         .expect("the read-only benchmark task");
@@ -468,7 +469,8 @@ async fn a_strategy_run_reports_hit_rate_cost_waste_and_latency_change() {
         18,
     )])
     .await;
-    let task = tasks()
+    let bench_tasks = tasks();
+    let task = bench_tasks
         .iter()
         .find(|task| task.name == "read_and_answer")
         .expect("the read-only benchmark task");
@@ -538,7 +540,11 @@ async fn the_shell_minimal_profile_speculates_less_of_the_same_work() {
 
     let mut coverage = Vec::new();
     for name in ["read_and_answer", "read_and_answer_shell"] {
-        let task = tasks().iter().find(|task| task.name == name).expect(name);
+        let bench_tasks = tasks();
+        let task = bench_tasks
+            .iter()
+            .find(|task| task.name == name)
+            .expect(name);
         let report = run_task(task, &config, &dir.path().join(name))
             .await
             .unwrap();
@@ -591,7 +597,7 @@ async fn live_strategies_compare_under_equal_budgets() {
         speculate: None,
     };
 
-    for task in tasks() {
+    for task in &tasks() {
         let baseline = run_task(task, &config, &dir.path().join("baseline"))
             .await
             .unwrap();

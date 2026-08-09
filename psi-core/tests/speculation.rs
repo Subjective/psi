@@ -191,7 +191,8 @@ async fn speculation_leaves_agent_visible_results_unchanged() {
 
 #[tokio::test]
 async fn oracle_run_beats_the_baseline_and_hits_every_call() {
-    let task = tasks()
+    let bench_tasks = tasks();
+    let task = bench_tasks
         .iter()
         .find(|task| task.name == "read_and_answer")
         .expect("the read-only benchmark task");

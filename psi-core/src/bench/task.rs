@@ -1,7 +1,9 @@
 //! The benchmark tasks. A task is a fixture workspace, a tool profile, a
-//! scripted model, and a success criterion, written as Rust values rather than
-//! a data format: a data format would have to grow a language for the model
-//! script and the criterion, and neither is something a benchmark run varies.
+//! scripted model, and a success criterion. The hand-written tasks below are
+//! Rust values — a data format would have to grow a language for the script
+//! and the criterion — while recorded tasks (`super::record`) are loaded from
+//! a recording's artifacts; both meet in one owned `BenchTask`, so the runner
+//! cannot tell them apart.
 //!
 //! Every task runs against a real tool profile, so a task's tools really read
 //! and really patch the fixture and its success criterion is a claim about the
@@ -12,7 +14,8 @@
 //! their speculation stats is the experiment docs/design.md schedules — whether
 //! the structured read-only tools earn their schema cost.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::json;
 
@@ -21,62 +24,90 @@ use crate::model::{ModelEvent, ToolCallRequest, Usage};
 use crate::tool::ToolRegistry;
 use crate::tools::{default_profile, shell_minimal_profile};
 
+pub type ProfileFn = Arc<dyn Fn(PathBuf) -> ToolRegistry + Send + Sync>;
+pub type ScriptFn = Arc<dyn Fn() -> Vec<FakeResponse> + Send + Sync>;
+pub type SuccessFn = Arc<dyn Fn(&Path, &[String]) -> bool + Send + Sync>;
+
 /// One deterministic benchmark task.
+#[derive(Clone)]
 pub struct BenchTask {
-    pub name: &'static str,
+    pub name: String,
     /// Written into a fresh workspace before every trial, as `(path,
     /// contents)`.
-    pub fixture: &'static [(&'static str, &'static str)],
+    pub fixture: Vec<(String, String)>,
     /// The tools this task advertises, built over the trial's workspace. The
     /// agent and the predictor share it.
-    pub profile: fn(PathBuf) -> ToolRegistry,
+    pub profile: ProfileFn,
     /// One user message per turn.
-    pub prompts: &'static [&'static str],
+    pub prompts: Vec<String>,
     /// The model's responses, in order, across every turn of the task.
-    pub script: fn() -> Vec<FakeResponse>,
+    pub script: ScriptFn,
     /// Did the run end in the expected state? Takes the workspace root and
     /// each turn's final assistant message, which are the two forms an answer
     /// takes: what the agent changed and what it said.
-    pub success: fn(&std::path::Path, &[String]) -> bool,
+    pub success: SuccessFn,
+    /// How the replay is timed (`super::run_trial` branches on it).
+    pub timing: Timing,
 }
 
-/// Every task a baseline covers.
-pub fn tasks() -> &'static [BenchTask] {
-    &TASKS
+/// Where a replay's time comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timing {
+    /// Hand-written tasks: the run config's model delay and injected latency
+    /// distributions — the controlled instrument.
+    Injected,
+    /// Recorded tasks: the script's own generation delays and each call's
+    /// recorded duration — the realistic one. The run config's timing knobs
+    /// are ignored.
+    Recorded,
 }
 
-static TASKS: [BenchTask; 3] = [
-    BenchTask {
-        name: "fix_and_test",
-        fixture: FIX_AND_TEST_FIXTURE,
-        profile: default_profile,
-        prompts: &["make the test pass"],
-        script: fix_and_test_script,
-        success: fix_and_test_success,
-    },
-    BenchTask {
-        name: "read_and_answer",
-        fixture: READ_AND_ANSWER_FIXTURE,
-        profile: default_profile,
-        prompts: &[
-            "which module owns the retry budget?",
-            "how many retries does it allow?",
-        ],
-        script: read_and_answer_script,
-        success: read_and_answer_success,
-    },
-    BenchTask {
-        name: "read_and_answer_shell",
-        fixture: READ_AND_ANSWER_FIXTURE,
-        profile: shell_minimal_profile,
-        prompts: &[
-            "which module owns the retry budget?",
-            "how many retries does it allow?",
-        ],
-        script: read_and_answer_shell_script,
-        success: read_and_answer_success,
-    },
-];
+/// Every hand-written task a baseline covers.
+pub fn tasks() -> Vec<BenchTask> {
+    vec![
+        BenchTask {
+            name: "fix_and_test".into(),
+            fixture: owned(FIX_AND_TEST_FIXTURE),
+            profile: Arc::new(default_profile),
+            prompts: vec!["make the test pass".into()],
+            script: Arc::new(fix_and_test_script),
+            success: Arc::new(fix_and_test_success),
+            timing: Timing::Injected,
+        },
+        BenchTask {
+            name: "read_and_answer".into(),
+            fixture: owned(READ_AND_ANSWER_FIXTURE),
+            profile: Arc::new(default_profile),
+            prompts: read_and_answer_prompts(),
+            script: Arc::new(read_and_answer_script),
+            success: Arc::new(read_and_answer_success),
+            timing: Timing::Injected,
+        },
+        BenchTask {
+            name: "read_and_answer_shell".into(),
+            fixture: owned(READ_AND_ANSWER_FIXTURE),
+            profile: Arc::new(shell_minimal_profile),
+            prompts: read_and_answer_prompts(),
+            script: Arc::new(read_and_answer_shell_script),
+            success: Arc::new(read_and_answer_success),
+            timing: Timing::Injected,
+        },
+    ]
+}
+
+fn owned(fixture: &[(&str, &str)]) -> Vec<(String, String)> {
+    fixture
+        .iter()
+        .map(|(path, contents)| (path.to_string(), contents.to_string()))
+        .collect()
+}
+
+fn read_and_answer_prompts() -> Vec<String> {
+    vec![
+        "which module owns the retry budget?".into(),
+        "how many retries does it allow?".into(),
+    ]
+}
 
 /// A shell library whose test passes only after the fix, so "did the run
 /// succeed" is a question about the workspace.
@@ -89,14 +120,14 @@ static FIX_AND_TEST_FIXTURE: &[(&str, &str)] = &[
 ];
 
 /// The fix landed and the agent said so.
-fn fix_and_test_success(workspace: &std::path::Path, answers: &[String]) -> bool {
+fn fix_and_test_success(workspace: &Path, answers: &[String]) -> bool {
     let patched = std::fs::read_to_string(workspace.join("src/lib.sh"))
         .is_ok_and(|text| text.contains("echo 42"));
     patched && answers.last().is_some_and(|answer| answer.contains("42"))
 }
 
 /// Both questions were answered from the fixture.
-fn read_and_answer_success(_workspace: &std::path::Path, answers: &[String]) -> bool {
+fn read_and_answer_success(_workspace: &Path, answers: &[String]) -> bool {
     answers.len() == 2 && answers[0].contains("budget.rs") && answers[1].contains("3 retries")
 }
 
