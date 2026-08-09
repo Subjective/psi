@@ -33,8 +33,9 @@ pub type SuccessFn = Arc<dyn Fn(&Path, &[String]) -> bool + Send + Sync>;
 pub struct BenchTask {
     pub name: String,
     /// Written into a fresh workspace before every trial, as `(path,
-    /// contents)`.
-    pub fixture: Vec<(String, String)>,
+    /// contents)`. Bytes, not text: a recorded fixture snapshots whatever the
+    /// live workspace held, and not all of it is UTF-8.
+    pub fixture: Vec<(String, Vec<u8>)>,
     /// The tools this task advertises, built over the trial's workspace. The
     /// agent and the predictor share it.
     pub profile: ProfileFn,
@@ -95,10 +96,10 @@ pub fn tasks() -> Vec<BenchTask> {
     ]
 }
 
-fn owned(fixture: &[(&str, &str)]) -> Vec<(String, String)> {
+fn owned(fixture: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
     fixture
         .iter()
-        .map(|(path, contents)| (path.to_string(), contents.to_string()))
+        .map(|(path, contents)| (path.to_string(), contents.as_bytes().to_vec()))
         .collect()
 }
 

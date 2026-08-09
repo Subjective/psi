@@ -13,16 +13,18 @@
 //! fixture/         the workspace as the live run started
 //! final/           the workspace as the live run left it
 //! sessions/        the live run's session log, exactly as the harness wrote it
-//! trace.jsonl      the live run's trace, for later analysis
+//! trace.jsonl      the live run's trace: per-turn usage for the replay, the
+//!                  rest for later analysis
 //! ```
 //!
 //! Replay is timed by the recording rather than by injected distributions: the
 //! script carries each response's real generation delay, and every tool call
-//! sleeps its recorded duration, keyed by the call's canonical identity — so a
-//! speculative execution of a call costs exactly what that call cost live, and
-//! a run's measurements cannot be shifted by how many guesses ran.
+//! is stretched to its recorded duration, keyed by the call's canonical
+//! identity — so a speculative execution of a call costs exactly what that
+//! call cost live, and a run's measurements cannot be shifted by how many
+//! guesses ran.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::fake::FakeResponse;
 use crate::hook::HookRegistry;
 use crate::item::{CompletionStatus, Item, ItemPayload};
-use crate::model::{ModelBackend, ModelEvent, ToolCallRequest};
+use crate::model::{ModelBackend, ModelEvent, ToolCallRequest, Usage};
 use crate::speculation::canonical_json;
 use crate::store::SessionStore;
 use crate::tool::{Tool, ToolEffect, ToolFuture, ToolInvocation, ToolRegistry, ToolSpec};
@@ -117,14 +119,7 @@ pub async fn record_task(
 pub fn recorded_task(dir: &Path) -> io::Result<BenchTask> {
     let meta: RecordingMeta = serde_json::from_slice(&std::fs::read(dir.join("recording.json"))?)
         .map_err(io::Error::other)?;
-    let fixture = read_files(&dir.join("fixture"))?
-        .into_iter()
-        .map(|(path, bytes)| {
-            String::from_utf8(bytes)
-                .map(|text| (path.clone(), text))
-                .map_err(|_| io::Error::other(format!("fixture file is not UTF-8: {path}")))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+    let fixture = read_files(&dir.join("fixture"))?;
 
     let store = SessionStore::new(dir.join("sessions"))?;
     let recorded =
@@ -133,7 +128,8 @@ pub fn recorded_task(dir: &Path) -> io::Result<BenchTask> {
         })?;
     let (snapshot, _log) = store.load(&recorded.id)?;
 
-    let template = Arc::new(script_from_items(&snapshot.items)?);
+    let usages = recorded_usages(&dir.join("trace.jsonl"))?;
+    let template = Arc::new(script_from_items(&snapshot.items, &usages)?);
     let durations = RecordedDurations::of(&snapshot.items);
     let finals = read_files(&dir.join("final"))?;
 
@@ -141,7 +137,9 @@ pub fn recorded_task(dir: &Path) -> io::Result<BenchTask> {
         name: meta.name,
         fixture,
         profile: Arc::new(move |workspace: PathBuf| {
-            replay_durations(default_profile(workspace), durations.clone())
+            // Every profile — every trial — starts the recorded sequences
+            // from the beginning.
+            replay_durations(default_profile(workspace), durations.fresh())
         }) as ProfileFn,
         prompts: meta.prompts,
         script: Arc::new(move || template.iter().cloned().collect()) as ScriptFn,
@@ -150,6 +148,20 @@ pub fn recorded_task(dir: &Path) -> io::Result<BenchTask> {
         }) as SuccessFn,
         timing: Timing::Recorded,
     })
+}
+
+/// The per-turn usage the live run reported, in turn order. Usage is never
+/// persisted as an item, so it is read back from the trace the recorder keeps:
+/// each turn's total rides on its `TurnFinished` record.
+fn recorded_usages(path: &Path) -> io::Result<Vec<Option<Usage>>> {
+    Ok(std::fs::read_to_string(path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<TraceRecord>(line).ok())
+        .filter_map(|record| match record {
+            TraceRecord::TurnFinished { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Rebuilds the model's responses from a recorded session's items.
@@ -161,13 +173,22 @@ pub fn recorded_task(dir: &Path) -> io::Result<BenchTask> {
 /// the item that preceded it to its last streamed item, which is what the
 /// authoritative model actually spent.
 ///
+/// `usages` is each turn's recorded token total, in turn order. The engine
+/// sums usage over a turn's responses, so the whole total rides on the turn's
+/// last response and the replayed turn reports what the live one billed.
+///
 /// The conversion refuses interrupted recordings: a cancelled item, a failed
 /// item that is not a tool's own error, or a call whose arguments never
 /// finished all mean the recording is not a complete run.
-pub fn script_from_items(items: &[Item]) -> io::Result<Vec<FakeResponse>> {
+pub fn script_from_items(
+    items: &[Item],
+    usages: &[Option<Usage>],
+) -> io::Result<Vec<FakeResponse>> {
     let mut script = Vec::new();
     let mut events: Vec<ModelEvent> = Vec::new();
     let mut saw_result = false;
+    // Which turn the response being built belongs to, indexing `usages`.
+    let mut turn = 0usize;
     // `created_at_ms` of the item preceding the open response, and of the
     // response's last streamed item: their distance is the generation delay.
     let mut base_ms: Option<u64> = None;
@@ -177,11 +198,15 @@ pub fn script_from_items(items: &[Item]) -> io::Result<Vec<FakeResponse>> {
     let flush = |events: &mut Vec<ModelEvent>,
                  base_ms: u64,
                  last_streamed_ms: u64,
+                 usage: Option<Usage>,
                  script: &mut Vec<_>| {
         if events.is_empty() {
             return;
         }
         let mut response = std::mem::take(events);
+        if let Some(usage) = usage {
+            response.push(ModelEvent::Usage { usage });
+        }
         response.push(ModelEvent::Completed);
         script.push(FakeResponse::new(response).delayed(last_streamed_ms.saturating_sub(base_ms)));
     };
@@ -199,8 +224,14 @@ pub fn script_from_items(items: &[Item]) -> io::Result<Vec<FakeResponse>> {
         }
         match &item.payload {
             ItemPayload::UserMessage { .. } => {
-                let base = base_ms.unwrap_or(item.created_at_ms);
-                flush(&mut events, base, last_streamed_ms, &mut script);
+                // A user message closes the previous turn, so the response
+                // flushed here is that turn's last and carries its usage.
+                if !events.is_empty() {
+                    let base = base_ms.unwrap_or(item.created_at_ms);
+                    let usage = usages.get(turn).copied().flatten();
+                    flush(&mut events, base, last_streamed_ms, usage, &mut script);
+                    turn += 1;
+                }
                 saw_result = false;
                 base_ms = Some(item.created_at_ms);
             }
@@ -214,8 +245,9 @@ pub fn script_from_items(items: &[Item]) -> io::Result<Vec<FakeResponse>> {
                     ));
                 };
                 if saw_result {
-                    // A streamed item after a result: the next response began.
-                    flush(&mut events, base, last_streamed_ms, &mut script);
+                    // A streamed item after a result: the next response began
+                    // mid-turn, so no usage rides on the one being closed.
+                    flush(&mut events, base, last_streamed_ms, None, &mut script);
                     saw_result = false;
                     base_ms = Some(previous_ms);
                 }
@@ -264,6 +296,7 @@ pub fn script_from_items(items: &[Item]) -> io::Result<Vec<FakeResponse>> {
         &mut events,
         base_ms.unwrap_or(0),
         last_streamed_ms,
+        usages.get(turn).copied().flatten(),
         &mut script,
     );
     Ok(script)
@@ -274,9 +307,15 @@ pub fn script_from_items(items: &[Item]) -> io::Result<Vec<FakeResponse>> {
 /// the runtime supplies. Identity-keyed rather than drawn in call order, so a
 /// speculative execution and the authoritative call it stands for cost the
 /// same, however many guesses ran.
+///
+/// The sequences themselves are immutable; what advances is a cursor per
+/// identity. `fresh` resets the cursors and `clone` shares them, so one
+/// replay's progress never leaks into the next: every trial consumes the
+/// recorded sequences from the start.
 #[derive(Clone)]
 pub struct RecordedDurations {
-    by_identity: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
+    by_identity: Arc<HashMap<String, Vec<u64>>>,
+    cursors: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl RecordedDurations {
@@ -293,7 +332,7 @@ impl RecordedDurations {
                 identities.insert(call_id, identity(tool, arguments));
             }
         }
-        let mut by_identity: HashMap<String, VecDeque<u64>> = HashMap::new();
+        let mut by_identity: HashMap<String, Vec<u64>> = HashMap::new();
         for item in items {
             if let ItemPayload::ToolResult {
                 call_id,
@@ -305,11 +344,21 @@ impl RecordedDurations {
                 by_identity
                     .entry(identity.clone())
                     .or_default()
-                    .push_back(*duration_ms);
+                    .push(*duration_ms);
             }
         }
         Self {
-            by_identity: Arc::new(Mutex::new(by_identity)),
+            by_identity: Arc::new(by_identity),
+            cursors: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The same recorded sequences with the cursors reset: one replay's
+    /// consumption, shared by the tools of one profile.
+    pub fn fresh(&self) -> Self {
+        Self {
+            by_identity: self.by_identity.clone(),
+            cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -319,13 +368,12 @@ impl RecordedDurations {
     /// A call the recording never made gets no added time: a wrong guess runs
     /// at fixture speed, and its waste is counted in tokens, not wall time.
     fn next_ms(&self, identity: &str) -> Option<u64> {
-        let mut map = self.by_identity.lock().expect("durations lock");
-        let queue = map.get_mut(identity)?;
-        match queue.len() {
-            0 => None,
-            1 => queue.front().copied(),
-            _ => queue.pop_front(),
-        }
+        let sequence = self.by_identity.get(identity)?;
+        let mut cursors = self.cursors.lock().expect("durations lock");
+        let at = cursors.entry(identity.to_string()).or_insert(0);
+        let ms = sequence.get(*at).or(sequence.last()).copied();
+        *at = (*at + 1).min(sequence.len());
+        ms
     }
 }
 
@@ -333,9 +381,13 @@ fn identity(tool: &str, arguments: &serde_json::Value) -> String {
     format!("{tool} {}", canonical_json(arguments))
 }
 
-/// A tool that takes as long as the recording says this call took. The engine
-/// measures a call around the whole future, so the replayed time lands in the
-/// `tool_result` duration exactly as the live time did.
+/// A tool that takes as long as the recording says this call took: it runs
+/// the real tool, then sleeps whatever remains of the recorded duration. The
+/// recorded time already contains the live execution, so it is a total to
+/// reach, not a surcharge — sleeping the whole of it on top of the replayed
+/// execution would double-count exactly the calls whose time matters most.
+/// The engine measures a call around the whole future, so the replayed time
+/// lands in the `tool_result` duration exactly as the live time did.
 struct ReplayedTool {
     inner: Arc<dyn Tool>,
     durations: RecordedDurations,
@@ -355,10 +407,16 @@ impl Tool for ReplayedTool {
         let delay = self.durations.next_ms(&key);
         let inner = self.inner.clone();
         Box::pin(async move {
+            let started = tokio::time::Instant::now();
+            let result = inner.execute(invocation).await;
             if let Some(ms) = delay {
-                tokio::time::sleep(Duration::from_millis(ms)).await;
+                let recorded = Duration::from_millis(ms);
+                let elapsed = started.elapsed();
+                if recorded > elapsed {
+                    tokio::time::sleep(recorded - elapsed).await;
+                }
             }
-            inner.execute(invocation).await
+            result
         })
     }
 }

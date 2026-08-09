@@ -224,7 +224,7 @@ fn backend(config: &VllmConfig, workspace: &Path) -> std::io::Result<Arc<dyn Mod
 
 /// Writes a task's fixture into an empty directory, replacing whatever an
 /// earlier trial left, so every trial starts from the same workspace.
-fn lay_out_fixture(workspace: &Path, fixture: &[(String, String)]) -> std::io::Result<()> {
+fn lay_out_fixture(workspace: &Path, fixture: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     match std::fs::remove_dir_all(workspace) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

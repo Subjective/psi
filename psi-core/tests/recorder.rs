@@ -14,8 +14,8 @@ use psi_core::bench::{
 };
 use psi_core::fake::{FakeModel, FakeResponse, FakeTool};
 use psi_core::item::{CompletionStatus, Item, ItemId, ItemPayload, TurnId, WorkspaceRevision};
-use psi_core::model::{ModelEvent, ToolCallRequest};
-use psi_core::tool::{ToolEffect, ToolInvocation, ToolRegistry};
+use psi_core::model::{ModelEvent, ToolCallRequest, Usage};
+use psi_core::tool::{Tool, ToolEffect, ToolFuture, ToolInvocation, ToolRegistry, ToolSpec};
 use psi_core::trace::RunTrace;
 use serde_json::json;
 
@@ -54,6 +54,12 @@ fn live_script() -> Vec<FakeResponse> {
             ModelEvent::TextDelta {
                 delta: "Raised the limit.".into(),
             },
+            ModelEvent::Usage {
+                usage: Usage {
+                    input_tokens: 1_200,
+                    output_tokens: 40,
+                },
+            },
             ModelEvent::Completed,
         ]),
         FakeResponse::new(vec![
@@ -64,14 +70,23 @@ fn live_script() -> Vec<FakeResponse> {
             ModelEvent::TextDelta {
                 delta: "It reads limit=2 now.".into(),
             },
+            ModelEvent::Usage {
+                usage: Usage {
+                    input_tokens: 900,
+                    output_tokens: 25,
+                },
+            },
             ModelEvent::Completed,
         ]),
     ]
 }
 
+/// A snapshot of a real workspace is not all UTF-8; `logo.bin` keeps the
+/// round trip honest about that.
 fn fixture(dir: &Path) {
     std::fs::write(dir.join("notes.txt"), "remember the limit\n").unwrap();
     std::fs::write(dir.join("config.txt"), "limit=1\n").unwrap();
+    std::fs::write(dir.join("logo.bin"), [0u8, 159, 146, 150]).unwrap();
 }
 
 async fn record_live_run(root: &Path) -> std::path::PathBuf {
@@ -102,7 +117,13 @@ async fn a_recorded_run_replays_itself() {
     assert!(
         task.fixture
             .iter()
-            .any(|(path, contents)| path == "config.txt" && contents == "limit=1\n")
+            .any(|(path, contents)| path == "config.txt" && contents.as_slice() == b"limit=1\n")
+    );
+    // The snapshot's binary file loads and replays as bytes.
+    assert!(
+        task.fixture
+            .iter()
+            .any(|(path, contents)| path == "logo.bin" && contents.as_slice() == [0, 159, 146, 150])
     );
 
     let config = BenchConfig {
@@ -146,6 +167,23 @@ async fn a_recorded_run_replays_itself() {
         ]
     );
     assert_eq!(replay.turns.len(), 2);
+
+    // Usage is not persisted as an item; it comes back from the trace, so the
+    // replayed turns report what the live ones billed.
+    let tokens: Vec<Option<Usage>> = replay.turns.iter().map(|turn| turn.usage).collect();
+    assert_eq!(
+        tokens,
+        [
+            Some(Usage {
+                input_tokens: 1_200,
+                output_tokens: 40,
+            }),
+            Some(Usage {
+                input_tokens: 900,
+                output_tokens: 25,
+            }),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -288,7 +326,14 @@ fn round_boundaries_and_delays_recover_from_the_item_log() {
         ),
     ];
 
-    let script = script_from_items(&items).unwrap();
+    let script = script_from_items(
+        &items,
+        &[Some(Usage {
+            input_tokens: 100,
+            output_tokens: 9,
+        })],
+    )
+    .unwrap();
     assert_eq!(script.len(), 2);
     assert_eq!(
         script[0].delay_ms, 1_050,
@@ -311,9 +356,11 @@ fn round_boundaries_and_delays_recover_from_the_item_log() {
         })
         .collect();
     assert_eq!(kinds, ["reasoning", "call", "call", "completed"]);
+    // The turn's usage rides on its last response, and only that one.
     assert!(matches!(
         &script[1].events[..],
-        [ModelEvent::TextDelta { delta }, ModelEvent::Completed] if delta == "done"
+        [ModelEvent::TextDelta { delta }, ModelEvent::Usage { usage }, ModelEvent::Completed]
+            if delta == "done" && usage.input_tokens == 100 && usage.output_tokens == 9
     ));
 }
 
@@ -331,7 +378,7 @@ fn an_interrupted_recording_is_refused() {
             },
         ),
     ];
-    let err = script_from_items(&items).unwrap_err();
+    let err = script_from_items(&items, &[]).unwrap_err();
     assert!(err.to_string().contains("interrupted"), "{err}");
 }
 
@@ -368,4 +415,90 @@ async fn recorded_durations_replay_by_identity_not_call_order() {
     assert!(run(json!({ "path": "slow.txt" })).await >= 80);
     // A call the recording never made adds nothing.
     assert!(run(json!({ "path": "other.txt" })).await < 40);
+}
+
+/// A tool that takes real time, standing in for a live `exec`.
+struct SlowTool {
+    inner: FakeTool,
+    delay: std::time::Duration,
+}
+
+impl Tool for SlowTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    fn effect(&self) -> ToolEffect {
+        self.inner.effect()
+    }
+
+    fn execute(&self, invocation: ToolInvocation) -> ToolFuture {
+        let future = self.inner.execute(invocation);
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            future.await
+        })
+    }
+}
+
+async fn timed(registry: &ToolRegistry, arguments: serde_json::Value) -> u64 {
+    let tool = registry.get("read_file").unwrap().clone();
+    let started = Instant::now();
+    tool.execute(ToolInvocation {
+        call_id: "x".into(),
+        arguments,
+        cwd: "/fixture".into(),
+    })
+    .await;
+    started.elapsed().as_millis() as u64
+}
+
+/// The recorded duration contains the live execution, so the replay reaches
+/// it rather than adds to it: a call whose replayed execution takes 50ms of a
+/// recorded 90ms sleeps only the remaining 40.
+#[tokio::test]
+async fn a_replayed_execution_counts_toward_its_recorded_duration() {
+    let items = vec![
+        user(0, 0, 0),
+        tool_call(1, 0, 0, "c1", "slow.txt"),
+        tool_result(2, 0, 0, "c1", 90),
+    ];
+    let mut registry = ToolRegistry::new();
+    registry.register(SlowTool {
+        inner: FakeTool::canned("read_file", ToolEffect::ReadOnly, "x"),
+        delay: std::time::Duration::from_millis(50),
+    });
+    let replayed = psi_core::bench::replay_durations(registry, RecordedDurations::of(&items));
+
+    let elapsed = timed(&replayed, json!({ "path": "slow.txt" })).await;
+    assert!((90..135).contains(&elapsed), "took {elapsed}ms");
+}
+
+/// Each profile starts the recorded sequences from the beginning: one trial's
+/// consumption must not leave the next trial — or the speculative run beside
+/// it — replaying different timings.
+#[tokio::test]
+async fn each_profile_replays_the_sequences_from_the_start() {
+    let items = vec![
+        user(0, 0, 0),
+        tool_call(1, 0, 0, "c1", "twice.txt"),
+        tool_result(2, 0, 0, "c1", 80),
+        tool_call(3, 0, 0, "c2", "twice.txt"),
+        tool_result(4, 0, 0, "c2", 10),
+    ];
+    let durations = RecordedDurations::of(&items);
+    let profile = || {
+        let mut registry = ToolRegistry::new();
+        registry.register(FakeTool::canned("read_file", ToolEffect::ReadOnly, "x"));
+        psi_core::bench::replay_durations(registry, durations.fresh())
+    };
+
+    // The first profile consumes the sequence in order: 80 then 10.
+    let first = profile();
+    assert!(timed(&first, json!({ "path": "twice.txt" })).await >= 80);
+    assert!(timed(&first, json!({ "path": "twice.txt" })).await < 40);
+    // A second profile starts over at 80, not at the drained tail.
+    let second = profile();
+    assert!(timed(&second, json!({ "path": "twice.txt" })).await >= 80);
 }
