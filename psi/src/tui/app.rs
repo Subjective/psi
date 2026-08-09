@@ -125,6 +125,10 @@ pub struct App {
     /// Set once cancellation is asked for, cleared when the turn reports how it
     /// ended, so the status line can say the difference.
     cancelling: bool,
+    /// Set once a session switch is asked for, cleared when the new session
+    /// arrives. A prompt submitted in that window is refused rather than
+    /// recorded under the session being left.
+    switching: bool,
     quit: bool,
 }
 
@@ -141,6 +145,7 @@ impl App {
             history,
             outbox: Vec::new(),
             cancelling: false,
+            switching: false,
             quit: false,
         }
     }
@@ -265,9 +270,13 @@ impl App {
 
     pub fn on_event(&mut self, event: Event) {
         match &event.payload {
-            EventPayload::SessionCreated { meta } => self.session = Some(meta.id.clone()),
+            EventPayload::SessionCreated { meta } => {
+                self.session = Some(meta.id.clone());
+                self.switching = false;
+            }
             EventPayload::SessionLoaded { snapshot } => {
-                self.session = Some(snapshot.meta.id.clone())
+                self.session = Some(snapshot.meta.id.clone());
+                self.switching = false;
             }
             EventPayload::SessionsListed { sessions } => match &mut self.mode {
                 // `/resume` asked; the listing is the picker's rows.
@@ -280,8 +289,10 @@ impl App {
                             (meta.id.clone(), format!("{}  {age}", meta.id.0))
                         })
                         .collect();
-                    picker.matches = picker.rows.clone();
                     picker.selected = 0;
+                    // The user may have typed a query while the listing was in
+                    // flight; the rows arrive to meet it, not to replace it.
+                    self.filter_sessions();
                 }
                 // Startup asked, to continue where the user left off. Nothing
                 // to continue is not an error: start fresh.
@@ -306,9 +317,22 @@ impl App {
             TerminalEvent::Paste(text) => {
                 self.composer.paste(&text);
                 // A paste into an open picker is more query, or the end of one.
-                self.filter_files();
+                self.refilter();
             }
             _ => {}
+        }
+    }
+
+    /// Re-runs the open overlay's filter after its query text changed without
+    /// a key press. Each filter decides for itself whether the new text
+    /// narrows the overlay or closes it.
+    fn refilter(&mut self) {
+        match self.mode {
+            AppMode::Compose => {}
+            AppMode::Branch(_) => self.filter_branch(),
+            AppMode::Sessions(_) => self.filter_sessions(),
+            AppMode::Files(_) => self.filter_files(),
+            AppMode::Commands(_) => self.filter_commands(),
         }
     }
 
@@ -398,7 +422,13 @@ impl App {
             "new" | "resume" if self.view.running() => {
                 self.view.notice("psi: wait for the turn to finish");
             }
-            "new" => self.outbox.push(Command::CreateSession),
+            "new" | "resume" if self.switching => {
+                self.view.notice("psi: wait for the session switch");
+            }
+            "new" => {
+                self.switching = true;
+                self.outbox.push(Command::CreateSession);
+            }
             "resume" => {
                 // The submit that carried `/resume` already cleared the
                 // composer, which is the picker's query box from here.
@@ -604,6 +634,7 @@ impl App {
         let Some((session_id, _)) = picker.matches.get(picker.selected) else {
             return;
         };
+        self.switching = true;
         self.outbox.push(Command::LoadSession {
             session_id: session_id.clone(),
         });
@@ -756,6 +787,13 @@ impl App {
             let command = command.to_string();
             self.composer.take();
             self.command(&command);
+            return;
+        }
+        // A switch is in flight: `self.session` still names the session being
+        // left, and a prompt sent now would be recorded under it. Refused, not
+        // queued — the composer keeps the text.
+        if self.switching {
+            self.view.notice("psi: wait for the session switch");
             return;
         }
         let Some(session_id) = self.session.clone() else {
@@ -1469,6 +1507,78 @@ mod tests {
         driver.app.on_key(key(KeyCode::Enter));
         assert!(driver.app.take_commands().is_empty());
         assert_eq!(driver.app.composer.text(), "   ");
+    }
+
+    /// A paste into an open picker must refilter it: the query the user sees
+    /// and the rows Enter acts on have to agree.
+    #[tokio::test]
+    async fn a_paste_into_a_picker_refilters_it() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut driver = driver(Vec::new(), &sessions);
+        typed(&mut driver.app, "/");
+        driver
+            .app
+            .on_terminal_event(TerminalEvent::Paste("quit".into()));
+        // Unfiltered, the palette's first row is `/new`; the paste must narrow
+        // the rows to `/quit` before Enter runs the selection.
+        driver.app.on_key(key(KeyCode::Enter));
+        assert!(driver.app.should_quit());
+    }
+
+    /// A `/resume` query typed before the listing arrives still applies to it.
+    #[tokio::test]
+    async fn a_query_typed_before_the_listing_arrives_filters_it() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut driver = driver(Vec::new(), &sessions);
+        driver.app.start(false);
+        driver.until(|d| d.app.session.is_some()).await;
+
+        typed(&mut driver.app, "/resume");
+        driver.app.on_key(key(KeyCode::Enter));
+        // The listing has not arrived; the query is already being typed.
+        typed(&mut driver.app, "zzz");
+        driver
+            .until(|d| matches!(&d.app.mode, AppMode::Sessions(picker) if !picker.rows.is_empty()))
+            .await;
+        // Nothing matches `zzz`, so Enter must load nothing — not the newest
+        // session, which is what an unfiltered listing would select.
+        let rows: Vec<String> = driver
+            .app
+            .overlay()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(rows, ["no sessions match"]);
+        driver.app.on_key(key(KeyCode::Enter));
+        assert!(driver.app.take_commands().is_empty());
+    }
+
+    /// A prompt submitted while a session switch is in flight is refused: sent
+    /// then, it would be recorded under the session being left.
+    #[tokio::test]
+    async fn a_prompt_during_a_session_switch_waits_for_the_new_session() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut driver = driver(vec![text("one")], &sessions);
+        driver.app.start(false);
+        driver.until(|d| d.app.session.is_some()).await;
+        let first = driver.app.session.clone().unwrap();
+
+        typed(&mut driver.app, "/new");
+        driver.app.on_key(key(KeyCode::Enter));
+        // The new session has not arrived: the submit must not go out, and the
+        // composer keeps the prompt.
+        typed(&mut driver.app, "hello");
+        driver.app.on_key(key(KeyCode::Enter));
+        assert_eq!(driver.app.composer.text(), "hello");
+
+        driver.until(|d| d.app.session != Some(first.clone())).await;
+        let second = driver.app.session.clone().unwrap();
+        driver.app.on_key(key(KeyCode::Enter));
+        let submitted = driver.app.take_commands();
+        assert!(submitted.iter().any(|command| matches!(
+            command,
+            Command::SubmitMessage { session_id, .. } if *session_id == second
+        )));
     }
 
     #[tokio::test]

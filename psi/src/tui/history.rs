@@ -23,6 +23,10 @@ pub struct History {
     /// The last prompt on file, so a prompt submitted twice in a row is not
     /// appended twice.
     last: Option<String>,
+    /// True when the file ends mid-line — a torn write. The next append then
+    /// starts with its own newline, so the torn tail stays one skipped line
+    /// instead of swallowing the new entry with it.
+    unterminated: bool,
 }
 
 impl History {
@@ -30,15 +34,23 @@ impl History {
     /// with, oldest last.
     pub fn open(dir: &Path) -> (Self, Vec<String>) {
         let path = dir.join("history");
-        let mut prompts: Vec<String> = std::fs::read_to_string(&path)
-            .unwrap_or_default()
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut prompts: Vec<String> = text
             .lines()
             // A line that does not parse is a torn write, not an entry.
             .filter_map(|line| serde_json::from_str::<String>(line).ok())
             .collect();
         let prompts = prompts.split_off(prompts.len().saturating_sub(LOADED));
         let last = prompts.last().cloned();
-        (Self { path, last }, prompts)
+        let unterminated = !text.is_empty() && !text.ends_with('\n');
+        (
+            Self {
+                path,
+                last,
+                unterminated,
+            },
+            prompts,
+        )
     }
 
     pub fn append(&mut self, prompt: &str) {
@@ -54,7 +66,9 @@ impl History {
             .append(true)
             .open(&self.path)
         {
-            let _ = writeln!(file, "{line}");
+            let lead = if self.unterminated { "\n" } else { "" };
+            let _ = writeln!(file, "{lead}{line}");
+            self.unterminated = false;
         }
     }
 }
@@ -113,6 +127,19 @@ mod tests {
         .unwrap();
         let (_, prompts) = History::open(dir.path());
         assert_eq!(prompts, ["one"]);
+    }
+
+    /// Appending after a crash mid-write must not glue the new entry onto the
+    /// torn tail, which would lose them both.
+    #[test]
+    fn appending_after_a_torn_tail_starts_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("history"), "\"one\"\n\"tw").unwrap();
+        let (mut history, prompts) = History::open(dir.path());
+        assert_eq!(prompts, ["one"]);
+        history.append("three");
+        let (_, prompts) = History::open(dir.path());
+        assert_eq!(prompts, ["one", "three"]);
     }
 
     /// The store lists `*.jsonl`; the history file must not look like one.
