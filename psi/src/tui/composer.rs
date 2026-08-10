@@ -523,16 +523,18 @@ impl Composer {
         } else {
             self.target(motion, count)
         };
-        // Vim's one exception to `w`: under an operator it stops at the end of
-        // a line rather than joining that line to the next.
-        if motion == Motion::WordForward && target > self.cursor {
-            let mut last = target;
-            while last > self.cursor && self.text.char(last - 1).is_whitespace() {
-                last -= 1;
-            }
-            if self.text.slice(last..target).chars().any(|c| c == '\n') {
-                target = last;
-            }
+        // Vim's one exception to `w`: under an operator it stops at the line
+        // break rather than joining that line to the next — everything up to
+        // the break goes, a last word's trailing blanks included.
+        if motion == Motion::WordForward
+            && target > self.cursor
+            && let Some(newline) = self
+                .text
+                .slice(self.cursor..target)
+                .chars()
+                .position(|c| c == '\n')
+        {
+            target = self.cursor + newline;
         }
         match scope {
             Scope::Linewise => {
@@ -1045,6 +1047,33 @@ mod tests {
         escape(&mut composer);
         typed(&mut composer, "k0ecw");
         assert_eq!(state(&composer), ("on\ntwo".into(), (0, 2), Mode::Insert));
+    }
+
+    /// Under an operator, `w` stops at the line break and takes everything
+    /// before it: a blank run is changed (the break survives), and a last
+    /// word's trailing blanks go with it. Expectations from headless Neovim.
+    #[test]
+    fn a_word_operator_takes_everything_up_to_the_line_break() {
+        // `cw` on the blanks before a break changes them and keeps the break.
+        let mut composer = fresh();
+        composer.paste("x  \nnext");
+        escape(&mut composer);
+        typed(&mut composer, "k0lcw");
+        assert_eq!(state(&composer), ("x\nnext".into(), (0, 1), Mode::Insert));
+
+        // Even when the whole line is blanks.
+        let mut composer = fresh();
+        composer.paste("   \nnext");
+        escape(&mut composer);
+        typed(&mut composer, "k0cw");
+        assert_eq!(state(&composer), ("\nnext".into(), (0, 0), Mode::Insert));
+
+        // `dw` from a line's last word takes its trailing blanks too.
+        let mut composer = fresh();
+        composer.paste("one  \nnext");
+        escape(&mut composer);
+        typed(&mut composer, "k0edw");
+        assert_eq!(state(&composer), ("on\nnext".into(), (0, 1), Mode::Normal));
     }
 
     /// `2cw` from a word's last character counts that end as the first of the
