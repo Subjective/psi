@@ -45,7 +45,7 @@ pub const HELP: &[&str] = &[
     "  ^a ^e ^u ^k ^w start · end · delete to start · to end · word back",
     "  @              file picker: type to filter, enter or tab inserts",
     "  ^b             branch tree: type to filter · enter edit · tab jump",
-    "  normal mode    i a o O x, h j k l, w b e, 0 $, dd, and counts",
+    "  normal mode    i a I A o O x, h j k l, w b e, 0 $, d/c + motion, dd/cc, counts",
     "",
     "commands:",
     "  /new           start a fresh session",
