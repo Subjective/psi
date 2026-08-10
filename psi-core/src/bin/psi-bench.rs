@@ -19,19 +19,28 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use psi_core::bench::{BenchConfig, Comparison, Speculation, Strategy, run_task, tasks};
+use psi_core::bench::{
+    BenchConfig, Comparison, Speculation, Strategy, record_task, recorded_task, run_task, tasks,
+};
+use psi_core::openai::{OpenAiBackend, OpenAiConfig};
 use psi_core::vllm::{Endpoint, VllmConfig};
 
 const USAGE: &str = "\
-usage: psi-bench [--trials N] [--dir PATH] [--strategy NAME]...
+usage: psi-bench [--trials N] [--dir PATH] [--recorded DIR]... [--strategy NAME]...
                  [--prediction-budget N] [--execution-budget N] [--samples N]
                  [--predictor-url URL] [--predictor-model NAME] [--predictor-chat]
+       psi-bench --record OUT --fixture DIR --task-name NAME --prompt TEXT...
 
   --trials N            how many times to run each task (default 5)
   --dir PATH            where traces, fixture workspaces, and sessions go
                         (default target/psi-bench/<start time>)
+  --recorded DIR        run this recording instead of the hand-written tasks;
+                        may be repeated. A recording replays with its own
+                        generation delays and tool durations, so --trials and
+                        the injected latency knobs do not shape it.
   --strategy NAME       also run each task under this prediction strategy and
                         report it against the baseline; may be repeated.
                         oracle | direct | branch
@@ -43,7 +52,15 @@ usage: psi-bench [--trials N] [--dir PATH] [--strategy NAME]...
                         http://localhost:8000/v1
   --predictor-model N   the served model name, when the server needs one
   --predictor-chat      send prediction requests through /v1/chat/completions
-                        instead of /v1/responses";
+                        instead of /v1/responses
+
+recording (drives the live agent once and stores the run as a benchmark task):
+  --record OUT          where the recording directory is created; must not exist
+  --fixture DIR         the workspace the live run starts from
+  --task-name NAME      the recorded task's name in reports and trace files
+  --prompt TEXT         one user message per turn; may be repeated
+                        environment: OPENAI_API_KEY (required), PSI_MODEL,
+                        PSI_BASE_URL";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -56,6 +73,11 @@ async fn main() -> ExitCode {
     let mut samples = 4;
     let mut predictor = VllmConfig::default();
     let mut predictor_url = None;
+    let mut recorded: Vec<PathBuf> = Vec::new();
+    let mut record_out: Option<PathBuf> = None;
+    let mut record_fixture: Option<PathBuf> = None;
+    let mut record_name: Option<String> = None;
+    let mut record_prompts: Vec<String> = Vec::new();
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -91,11 +113,49 @@ async fn main() -> ExitCode {
                 predictor.endpoint = Endpoint::ChatCompletions;
                 Ok(())
             }
+            "--recorded" => value().map(|path| recorded.push(PathBuf::from(path))),
+            "--record" => value().map(|path| record_out = Some(PathBuf::from(path))),
+            "--fixture" => value().map(|path| record_fixture = Some(PathBuf::from(path))),
+            "--task-name" => value().map(|name| record_name = Some(name.clone())),
+            "--prompt" => value().map(|prompt| record_prompts.push(prompt.clone())),
             other => Err(format!("unknown argument: {other}")),
         };
         if let Err(message) = parsed {
             return fail(&message);
         }
+    }
+
+    // Recording is its own mode: drive the live agent once, store the run,
+    // and exit. The stored recording replays via --recorded.
+    if let Some(out) = record_out {
+        let (Some(fixture), Some(name)) = (record_fixture, record_name) else {
+            return fail("--record needs --fixture and --task-name");
+        };
+        if record_prompts.is_empty() {
+            return fail("--record needs at least one --prompt");
+        }
+        let mut model = OpenAiConfig::default();
+        if let Ok(name) = std::env::var("PSI_MODEL") {
+            model.model = name;
+        }
+        if let Ok(base_url) = std::env::var("PSI_BASE_URL") {
+            model.base_url = base_url;
+        }
+        let backend = match OpenAiBackend::new(model) {
+            Ok(backend) => backend,
+            Err(err) => return fail(&err.to_string()),
+        };
+        return match record_task(&name, &fixture, &record_prompts, Arc::new(backend), &out).await {
+            Ok(()) => {
+                println!(
+                    "recorded {name} at {}\nreplay it with: psi-bench --recorded {}",
+                    out.display(),
+                    out.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(err) => fail(&format!("recording failed: {err}")),
+        };
     }
 
     if let Some(url) = predictor_url {
@@ -122,9 +182,20 @@ async fn main() -> ExitCode {
         Err(message) => return fail(&message),
     };
 
+    // Recordings replace the hand-written tasks when named: the flag says
+    // what to run.
+    let bench_tasks = if recorded.is_empty() {
+        tasks()
+    } else {
+        match recorded.iter().map(|dir| recorded_task(dir)).collect() {
+            Ok(tasks) => tasks,
+            Err(err) => return fail(&format!("loading a recording: {err}")),
+        }
+    };
+
     let dir = dir.unwrap_or_else(default_dir);
     println!("traces: {}\n", dir.display());
-    for task in tasks() {
+    for task in &bench_tasks {
         let baseline = match run_task(task, &config, &dir.join("baseline")).await {
             Ok(report) => report,
             Err(err) => return fail(&format!("{}: {err}", task.name)),

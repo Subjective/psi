@@ -30,9 +30,9 @@ fn test_config(trials: u32) -> BenchConfig {
     }
 }
 
-fn task(name: &str) -> &'static BenchTask {
+fn task(name: &str) -> BenchTask {
     tasks()
-        .iter()
+        .into_iter()
         .find(|task| task.name == name)
         .expect("unknown task")
 }
@@ -53,7 +53,7 @@ fn only_session(dir: &Path) -> Vec<psi_core::item::Item> {
 #[tokio::test]
 async fn a_run_is_reconstructed_from_its_trace() {
     let dir = tempfile::tempdir().unwrap();
-    let task = task("read_and_answer");
+    let task = &task("read_and_answer");
     let path = run_trial(task, 0, &test_config(1), dir.path())
         .await
         .unwrap();
@@ -171,11 +171,11 @@ fn shape(run: &RunTrace) -> Vec<String> {
 #[tokio::test]
 async fn repeated_trials_of_a_task_are_compared_from_their_traces() {
     let dir = tempfile::tempdir().unwrap();
-    let task = task("read_and_answer");
+    let task = &task("read_and_answer");
     let report = run_task(task, &test_config(3), dir.path()).await.unwrap();
 
     let runs: Vec<RunTrace> = (0..3)
-        .map(|trial| RunTrace::read(&RunTrace::path(dir.path(), task.name, trial)).unwrap())
+        .map(|trial| RunTrace::read(&RunTrace::path(dir.path(), &task.name, trial)).unwrap())
         .collect();
 
     // With fixed latencies every trial runs the same run: same items, same
@@ -232,7 +232,7 @@ async fn repeated_trials_of_a_task_are_compared_from_their_traces() {
 #[tokio::test]
 async fn a_task_that_edits_its_workspace_succeeds_and_is_traced() {
     let dir = tempfile::tempdir().unwrap();
-    let task = task("fix_and_test");
+    let task = &task("fix_and_test");
     let path = run_trial(task, 0, &test_config(1), dir.path())
         .await
         .unwrap();

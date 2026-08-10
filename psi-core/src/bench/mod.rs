@@ -14,13 +14,17 @@
 
 mod latency;
 mod oracle;
+mod record;
 mod report;
 mod task;
 
 pub use latency::{Latency, LatencyProfile, LatencyStream, inject_latency};
 pub use oracle::ReplayOracle;
+pub use record::{
+    RecordedDurations, record_task, recorded_task, replay_durations, script_from_items,
+};
 pub use report::{Comparison, SpeculationStats, Stats, TaskReport, ToolStats};
-pub use task::{BenchTask, tasks};
+pub use task::{BenchTask, Timing, tasks};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -122,20 +126,25 @@ pub async fn run_trial(
     dir: &Path,
 ) -> std::io::Result<PathBuf> {
     let workspace = dir.join(format!("{}-{trial}.workspace", task.name));
-    lay_out_fixture(&workspace, task.fixture)?;
+    lay_out_fixture(&workspace, &task.fixture)?;
 
-    let path = RunTrace::path(dir, task.name, trial);
+    let path = RunTrace::path(dir, &task.name, trial);
     let trace = TraceWriter::create(&path)?;
     trace.write(&TraceRecord::Run {
-        task: task.name.to_string(),
+        task: task.name.clone(),
         trial,
         started_at_ms: now_ms(),
     })?;
 
-    let script: Vec<_> = (task.script)()
-        .into_iter()
-        .map(|response| response.delayed(config.model_delay_ms))
-        .collect();
+    // A hand-written task is timed by the run config; a recorded one carries
+    // its own generation delays and tool durations (task::Timing).
+    let script: Vec<_> = match task.timing {
+        task::Timing::Injected => (task.script)()
+            .into_iter()
+            .map(|response| response.delayed(config.model_delay_ms))
+            .collect(),
+        task::Timing::Recorded => (task.script)(),
+    };
     let speculation = match &config.speculate {
         Some(speculate) => Some(SpeculationConfig {
             predictor: predictor(&speculate.strategy, &script, &workspace)?,
@@ -145,9 +154,17 @@ pub async fn run_trial(
         }),
         None => None,
     };
+    let tools = match task.timing {
+        task::Timing::Injected => {
+            inject_latency((task.profile)(workspace.clone()), &config.latency)
+        }
+        // A recorded task's profile already wraps its tools in their recorded
+        // durations, keyed by call identity rather than drawn in call order.
+        task::Timing::Recorded => (task.profile)(workspace.clone()),
+    };
     let (commands, mut events) = Harness::spawn(HarnessConfig {
         model: Arc::new(FakeModel::new(script)),
-        tools: inject_latency((task.profile)(workspace.clone()), &config.latency),
+        tools,
         hooks: HookRegistry::new(),
         workspace: workspace.clone(),
         sessions_dir: dir.join("sessions"),
@@ -158,7 +175,7 @@ pub async fn run_trial(
     let session_id = create_session(&commands, &mut events).await;
     let mut completed = true;
     let mut answers = Vec::new();
-    for prompt in task.prompts {
+    for prompt in &task.prompts {
         let (status, answer) = run_prompt(&commands, &mut events, &session_id, prompt).await;
         completed &= status == CompletionStatus::Completed;
         answers.push(answer);
@@ -207,7 +224,7 @@ fn backend(config: &VllmConfig, workspace: &Path) -> std::io::Result<Arc<dyn Mod
 
 /// Writes a task's fixture into an empty directory, replacing whatever an
 /// earlier trial left, so every trial starts from the same workspace.
-fn lay_out_fixture(workspace: &Path, fixture: &[(&str, &str)]) -> std::io::Result<()> {
+fn lay_out_fixture(workspace: &Path, fixture: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     match std::fs::remove_dir_all(workspace) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -224,7 +241,7 @@ fn lay_out_fixture(workspace: &Path, fixture: &[(&str, &str)]) -> std::io::Resul
     Ok(())
 }
 
-async fn create_session(
+pub(crate) async fn create_session(
     commands: &mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
 ) -> SessionId {
@@ -239,7 +256,7 @@ async fn create_session(
 /// assistant message it ended with. The trace records of a turn are written
 /// before the events that carry them, so the trace already holds the turn by
 /// the time this returns.
-async fn run_prompt(
+pub(crate) async fn run_prompt(
     commands: &mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
     session_id: &SessionId,
@@ -267,7 +284,7 @@ async fn run_prompt(
     panic!("the harness stopped mid-turn");
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")

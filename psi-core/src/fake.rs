@@ -10,7 +10,10 @@ use crate::model::{ModelBackend, ModelEvent, TurnRequest};
 use crate::tool::{Tool, ToolEffect, ToolFuture, ToolInvocation, ToolOutput, ToolSpec};
 
 /// One scripted model response. `hang` keeps the stream open after the events
-/// until the engine drops it, so tests can cancel mid-response.
+/// until the engine drops it, so tests can cancel mid-response. `Clone` exists
+/// for recorded tasks, whose script closure replays one stored template per
+/// trial (`crate::bench::recorded_task`).
+#[derive(Clone, Debug)]
 pub struct FakeResponse {
     pub events: Vec<ModelEvent>,
     pub hang: bool,
