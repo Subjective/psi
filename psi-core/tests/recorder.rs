@@ -409,8 +409,8 @@ async fn recorded_durations_replay_by_identity_not_call_order() {
         }
     };
 
-    // The recorded call takes its recorded time — and takes it again when the
-    // identity is exhausted, so a re-executed miss costs what the call costs.
+    // A guess (an id the recording never issued) costs what the recorded call
+    // it stands for cost — every time it runs, statelessly.
     assert!(run(json!({ "path": "slow.txt" })).await >= 80);
     assert!(run(json!({ "path": "slow.txt" })).await >= 80);
     // A call the recording never made adds nothing.
@@ -442,11 +442,11 @@ impl Tool for SlowTool {
     }
 }
 
-async fn timed(registry: &ToolRegistry, arguments: serde_json::Value) -> u64 {
+async fn timed(registry: &ToolRegistry, call_id: &str, arguments: serde_json::Value) -> u64 {
     let tool = registry.get("read_file").unwrap().clone();
     let started = Instant::now();
     tool.execute(ToolInvocation {
-        call_id: "x".into(),
+        call_id: call_id.into(),
         arguments,
         cwd: "/fixture".into(),
     })
@@ -471,15 +471,16 @@ async fn a_replayed_execution_counts_toward_its_recorded_duration() {
     });
     let replayed = psi_core::bench::replay_durations(registry, RecordedDurations::of(&items));
 
-    let elapsed = timed(&replayed, json!({ "path": "slow.txt" })).await;
+    let elapsed = timed(&replayed, "c1", json!({ "path": "slow.txt" })).await;
     assert!((90..135).contains(&elapsed), "took {elapsed}ms");
 }
 
-/// Each profile starts the recorded sequences from the beginning: one trial's
-/// consumption must not leave the next trial — or the speculative run beside
-/// it — replaying different timings.
+/// Authoritative calls replay under the recording's own call ids, so each
+/// takes exactly the time that call took live — in any order, repeatedly,
+/// across profiles. Nothing consumes anything: a discarded guess or an
+/// earlier trial cannot shift a later call's replayed time.
 #[tokio::test]
-async fn each_profile_replays_the_sequences_from_the_start() {
+async fn recorded_call_ids_replay_their_exact_durations_statelessly() {
     let items = vec![
         user(0, 0, 0),
         tool_call(1, 0, 0, "c1", "twice.txt"),
@@ -491,14 +492,40 @@ async fn each_profile_replays_the_sequences_from_the_start() {
     let profile = || {
         let mut registry = ToolRegistry::new();
         registry.register(FakeTool::canned("read_file", ToolEffect::ReadOnly, "x"));
-        psi_core::bench::replay_durations(registry, durations.fresh())
+        psi_core::bench::replay_durations(registry, durations.clone())
     };
 
-    // The first profile consumes the sequence in order: 80 then 10.
+    // Out of recorded order, and again after a guess ran in between: each
+    // recorded id keeps its own duration.
     let first = profile();
-    assert!(timed(&first, json!({ "path": "twice.txt" })).await >= 80);
-    assert!(timed(&first, json!({ "path": "twice.txt" })).await < 40);
-    // A second profile starts over at 80, not at the drained tail.
+    assert!(timed(&first, "c2", json!({ "path": "twice.txt" })).await < 40);
+    assert!(timed(&first, "guess-1", json!({ "path": "twice.txt" })).await >= 80);
+    assert!(timed(&first, "c1", json!({ "path": "twice.txt" })).await >= 80);
+    assert!(timed(&first, "c2", json!({ "path": "twice.txt" })).await < 40);
+    // A second profile replays identically.
     let second = profile();
-    assert!(timed(&second, json!({ "path": "twice.txt" })).await >= 80);
+    assert!(timed(&second, "c1", json!({ "path": "twice.txt" })).await >= 80);
+    assert!(timed(&second, "c2", json!({ "path": "twice.txt" })).await < 40);
+}
+
+/// `--record` pointed inside `--fixture` would snapshot the recording into
+/// itself; it is refused before any copying starts.
+#[tokio::test]
+async fn a_recording_nested_under_its_fixture_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("fixture");
+    std::fs::create_dir_all(&source).unwrap();
+    fixture(&source);
+
+    let out = source.join("recordings/run");
+    let err = record_task(
+        "nested",
+        &source,
+        &["go".into()],
+        Arc::new(FakeModel::new(Vec::new())),
+        &out,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("inside the fixture"), "{err}");
 }

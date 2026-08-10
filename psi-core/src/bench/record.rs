@@ -19,15 +19,16 @@
 //!
 //! Replay is timed by the recording rather than by injected distributions: the
 //! script carries each response's real generation delay, and every tool call
-//! is stretched to its recorded duration, keyed by the call's canonical
-//! identity — so a speculative execution of a call costs exactly what that
-//! call cost live, and a run's measurements cannot be shifted by how many
-//! guesses ran.
+//! is stretched to its recorded duration — authoritative calls by their
+//! recorded call ids, guesses by canonical identity — so a speculative
+//! execution costs exactly what the call it stands for cost live, and a run's
+//! measurements cannot be shifted by how many guesses ran or what became of
+//! them.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,18 @@ pub async fn record_task(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::create_dir(out)?; // Refuses to overwrite an existing recording.
+    // An output inside the fixture would be swept up by the snapshot below —
+    // copying the recording into itself until the disk gives out.
+    let out_root = std::fs::canonicalize(out)?;
+    let fixture_root = std::fs::canonicalize(fixture)?;
+    if out_root.starts_with(&fixture_root) {
+        std::fs::remove_dir(out)?;
+        return Err(io::Error::other(format!(
+            "the recording output {} sits inside the fixture {}",
+            out_root.display(),
+            fixture_root.display()
+        )));
+    }
     let workspace = out.join("workspace");
     copy_dir(fixture, &out.join("fixture"))?;
     copy_dir(fixture, &workspace)?;
@@ -137,9 +150,7 @@ pub fn recorded_task(dir: &Path) -> io::Result<BenchTask> {
         name: meta.name,
         fixture,
         profile: Arc::new(move |workspace: PathBuf| {
-            // Every profile — every trial — starts the recorded sequences
-            // from the beginning.
-            replay_durations(default_profile(workspace), durations.fresh())
+            replay_durations(default_profile(workspace), durations.clone())
         }) as ProfileFn,
         prompts: meta.prompts,
         script: Arc::new(move || template.iter().cloned().collect()) as ScriptFn,
@@ -302,20 +313,18 @@ pub fn script_from_items(
     Ok(script)
 }
 
-/// The recorded duration of every call, keyed by the call's canonical identity
-/// — the cache key's tool and canonical arguments, without the workspace state
-/// the runtime supplies. Identity-keyed rather than drawn in call order, so a
-/// speculative execution and the authoritative call it stands for cost the
-/// same, however many guesses ran.
-///
-/// The sequences themselves are immutable; what advances is a cursor per
-/// identity. `fresh` resets the cursors and `clone` shares them, so one
-/// replay's progress never leaks into the next: every trial consumes the
-/// recorded sequences from the start.
+/// The recorded duration of every call. The replayed script carries the
+/// recording's own call ids, so an authoritative call looks up exactly the
+/// duration that call took live; a speculative guess carries an id the
+/// recording never issued and falls back to the call's canonical identity —
+/// the cache key's tool and canonical arguments — costing what the (first)
+/// call it stands for cost live. Deliberately stateless: whatever runs, in
+/// whatever order, however it ends — baselines, speculative executions,
+/// discarded guesses — every trial replays identical timings.
 #[derive(Clone)]
 pub struct RecordedDurations {
-    by_identity: Arc<HashMap<String, Vec<u64>>>,
-    cursors: Arc<Mutex<HashMap<String, usize>>>,
+    by_call: Arc<HashMap<String, u64>>,
+    by_identity: Arc<HashMap<String, u64>>,
 }
 
 impl RecordedDurations {
@@ -332,7 +341,8 @@ impl RecordedDurations {
                 identities.insert(call_id, identity(tool, arguments));
             }
         }
-        let mut by_identity: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut by_call: HashMap<String, u64> = HashMap::new();
+        let mut by_identity: HashMap<String, u64> = HashMap::new();
         for item in items {
             if let ItemPayload::ToolResult {
                 call_id,
@@ -341,39 +351,25 @@ impl RecordedDurations {
             } = &item.payload
                 && let Some(identity) = identities.get(call_id.as_str())
             {
-                by_identity
-                    .entry(identity.clone())
-                    .or_default()
-                    .push(*duration_ms);
+                by_call.insert(call_id.clone(), *duration_ms);
+                by_identity.entry(identity.clone()).or_insert(*duration_ms);
             }
         }
         Self {
+            by_call: Arc::new(by_call),
             by_identity: Arc::new(by_identity),
-            cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// The same recorded sequences with the cursors reset: one replay's
-    /// consumption, shared by the tools of one profile.
-    pub fn fresh(&self) -> Self {
-        Self {
-            by_identity: self.by_identity.clone(),
-            cursors: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// The next recorded duration for one call. Repeated identical calls
-    /// consume their durations in order, and an exhausted identity repeats its
-    /// last — a re-executed miss costs what the call costs, not a fresh draw.
-    /// A call the recording never made gets no added time: a wrong guess runs
-    /// at fixture speed, and its waste is counted in tokens, not wall time.
-    fn next_ms(&self, identity: &str) -> Option<u64> {
-        let sequence = self.by_identity.get(identity)?;
-        let mut cursors = self.cursors.lock().expect("durations lock");
-        let at = cursors.entry(identity.to_string()).or_insert(0);
-        let ms = sequence.get(*at).or(sequence.last()).copied();
-        *at = (*at + 1).min(sequence.len());
-        ms
+    /// The recorded duration for one call: exact for a recorded call id, the
+    /// identity's first recorded duration for a guess. A call the recording
+    /// never made gets no added time: a wrong guess runs at fixture speed,
+    /// and its waste is counted in tokens, not wall time.
+    fn recorded_ms(&self, call_id: &str, identity: &str) -> Option<u64> {
+        self.by_call
+            .get(call_id)
+            .or_else(|| self.by_identity.get(identity))
+            .copied()
     }
 }
 
@@ -404,7 +400,7 @@ impl Tool for ReplayedTool {
 
     fn execute(&self, invocation: ToolInvocation) -> ToolFuture {
         let key = identity(&self.inner.spec().name, &invocation.arguments);
-        let delay = self.durations.next_ms(&key);
+        let delay = self.durations.recorded_ms(&invocation.call_id, &key);
         let inner = self.inner.clone();
         Box::pin(async move {
             let started = tokio::time::Instant::now();
@@ -449,7 +445,9 @@ fn matches_final_state(workspace: &Path, finals: &[(String, Vec<u8>)]) -> bool {
 }
 
 /// Every file under `root`, as workspace-relative paths, sorted for
-/// deterministic fixtures.
+/// deterministic fixtures. Paths and bytes only — file modes are not carried
+/// through a replay, so a fixture whose scripts must run invokes them through
+/// an interpreter (`sh test.sh`), not an execute bit.
 fn read_files(root: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
     fn walk(root: &Path, dir: &Path, files: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
