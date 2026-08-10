@@ -489,3 +489,21 @@ fn usage_sums_the_way_the_engine_reports_it() {
         }
     );
 }
+
+#[test]
+fn a_stream_error_surfaces_whatever_the_event_carries() {
+    use psi_core::model::ModelEvent;
+    let mut decoder = psi_core::responses::Decoder::default();
+    let nested =
+        serde_json::json!({ "type": "error", "error": { "message": "org must be verified" } });
+    match &decoder.decode(&nested)[..] {
+        [ModelEvent::Error { message }] => assert_eq!(message, "org must be verified"),
+        other => panic!("expected one error, got {other:?}"),
+    }
+    // A shape carrying no message anywhere surfaces raw rather than as a guess.
+    let odd = serde_json::json!({ "type": "error", "code": "rate_limited" });
+    match &decoder.decode(&odd)[..] {
+        [ModelEvent::Error { message }] => assert!(message.contains("rate_limited")),
+        other => panic!("expected one error, got {other:?}"),
+    }
+}

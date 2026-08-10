@@ -28,10 +28,12 @@ use super::view::{DisplayLine, Tone};
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Rows the inline viewport holds. Ratatui fixes an inline viewport's height
-/// when the terminal is built, so this is a constant: enough for a couple of
-/// lines of streaming text above a short composer and the status row, and few
-/// enough that an idle Psi is a prompt rather than a panel.
-const VIEWPORT_ROWS: u16 = 6;
+/// when the terminal is built, so this is a constant: the streaming tail and
+/// composer with room for a full picker below them and the status row.
+const VIEWPORT_ROWS: u16 = 11;
+
+/// Rows a picker shows at most; longer lists scroll within them.
+const PICKER_ROWS: u16 = 8;
 
 /// The composer's gutter: a prompt marker on the first row, alignment on the
 /// rest.
@@ -73,7 +75,12 @@ fn open() -> io::Result<Tui> {
 /// why it takes no terminal.
 pub fn restore() -> io::Result<()> {
     let mut stdout = io::stdout();
-    execute!(stdout, DisableBracketedPaste, cursor::Show)?;
+    execute!(
+        stdout,
+        DisableBracketedPaste,
+        cursor::SetCursorStyle::DefaultUserShape,
+        cursor::Show
+    )?;
     disable_raw_mode()
 }
 
@@ -121,10 +128,20 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
         let (rows, cursor) = wrap_composer(&composer.lines(), composer.cursor(), width - GUTTER);
         let available = area.height - 1;
         let composer_rows = (rows.len() as u16).clamp(1, available);
-        let live_rows = available - composer_rows;
 
+        // A picker opens below the composer, so opening one never moves the
+        // text being typed; the streaming tail takes whatever rows remain.
+        let overlay = wrap_all(&app.overlay(), width);
+        let overlay_rows = (overlay.len() as u16)
+            .min(PICKER_ROWS)
+            .min(available - composer_rows);
+        // Windowed like the live region, so the selection scrolls the list
+        // instead of walking off its visible slice.
+        let overlay = window(&overlay, overlay_rows as usize);
         let live = wrap_all(&app.live(), width);
-        let live = window(&live, live_rows as usize);
+        // One row stays reserved for the gap under a streaming tail.
+        let live_cap = (available - composer_rows - overlay_rows).saturating_sub(1);
+        let live = window(&live, live_cap as usize);
         for (offset, (tone, text)) in live.iter().enumerate() {
             frame.render_widget(
                 text.as_str(),
@@ -136,8 +153,13 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             );
         }
 
-        // Scroll the composer so the cursor's row is the last one shown.
-        let top = area.y + available - composer_rows;
+        // The composer rides under the streaming tail, behind the same blank
+        // the transcript will keep once the tail flushes — so it sits where
+        // the finished turn will leave it and never leaps. An empty tail
+        // leaves it against the scrollback, where a submitted prompt lands on
+        // the rows it was typed on.
+        let gap = if live.is_empty() { 0 } else { 1 };
+        let top = area.y + live.len() as u16 + gap;
         let first = cursor.0.saturating_sub(composer_rows as usize - 1);
         for offset in 0..composer_rows as usize {
             let Some(row) = rows.get(first + offset) else {
@@ -156,12 +178,28 @@ pub fn frame(terminal: &mut Tui, app: &App) -> io::Result<()> {
             top + (cursor.0 - first) as u16,
         ));
 
+        for (offset, (tone, text)) in overlay.iter().enumerate() {
+            let y = top + composer_rows + offset as u16;
+            frame.render_widget(text.as_str(), Rect::new(area.x, y, area.width, 1));
+            frame
+                .buffer_mut()
+                .set_style(Rect::new(area.x, y, area.width, 1), style(*tone));
+        }
+
+        // The status row carries news only, so it is often empty; it is dim
+        // text rather than a bar, which would be a full-width block of colour
+        // saying nothing.
         let status = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
         frame.render_widget(truncate(&app.status(), width).as_str(), status);
-        frame
-            .buffer_mut()
-            .set_style(status, status_style(composer.mode()));
+        frame.buffer_mut().set_style(status, style(Tone::Notice));
     })?;
+    // Vim's own signal, in place of a mode readout: a bar cursor writes, a
+    // block cursor commands. Terminals without DECSCUSR ignore the escape.
+    let shape = match app.composer().mode() {
+        Mode::Insert => cursor::SetCursorStyle::SteadyBar,
+        Mode::Normal => cursor::SetCursorStyle::SteadyBlock,
+    };
+    execute!(io::stdout(), shape)?;
     Ok(())
 }
 
@@ -176,6 +214,7 @@ fn style(tone: Tone) -> Style {
         Tone::ToolOutput => Style::default().fg(Color::DarkGray),
         Tone::DiffAdded => Style::default().fg(Color::Green),
         Tone::DiffRemoved => Style::default().fg(Color::Red),
+        Tone::Code => Style::default().add_modifier(Modifier::DIM),
         Tone::Notice => Style::default().fg(Color::DarkGray),
         Tone::Error => Style::default().fg(Color::Red),
         Tone::Selected => Style::default()
@@ -184,21 +223,42 @@ fn style(tone: Tone) -> Style {
     }
 }
 
-fn status_style(mode: Mode) -> Style {
-    let colour = match mode {
-        Mode::Insert => Color::Green,
-        Mode::Normal => Color::Blue,
-    };
-    Style::default().fg(Color::Black).bg(colour)
-}
-
 fn wrap_all(lines: &[DisplayLine], width: usize) -> Vec<(Tone, String)> {
     lines
         .iter()
         .flat_map(|line| {
-            wrap(&line.text, width)
-                .into_iter()
-                .map(move |row| (line.tone, row))
+            let rows = match line.tone {
+                // A prompt echo re-wraps the way the composer wrapped it, so a
+                // submitted prompt lands on the rows where it was typed.
+                Tone::User => wrap_gutter(&line.text, width),
+                _ => wrap(&line.text, width),
+            };
+            rows.into_iter().map(move |row| (line.tone, row))
+        })
+        .collect()
+}
+
+/// Splits a line's two-character gutter off and hard-wraps the rest at the
+/// composer's content width, indenting continuation rows to the gutter — the
+/// composer's own rendering, reproduced.
+fn wrap_gutter(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let (gutter, content) = chars.split_at(chars.len().min(GUTTER));
+    let gutter: String = gutter.iter().collect();
+    let width = width.saturating_sub(GUTTER).max(1);
+    if content.is_empty() {
+        return vec![gutter];
+    }
+    content
+        .chunks(width)
+        .enumerate()
+        .map(|(number, chunk)| {
+            let prefix = if number == 0 {
+                gutter.clone()
+            } else {
+                " ".repeat(GUTTER)
+            };
+            prefix + &chunk.iter().collect::<String>()
         })
         .collect()
 }
@@ -310,6 +370,25 @@ mod tests {
             wrap("/a/very/long/path/with/no/spaces", 10),
             ["/a/very/lo", "ng/path/wi", "th/no/spac", "es"]
         );
+    }
+
+    #[test]
+    fn a_prompt_echo_reproduces_the_composer_rows_exactly() {
+        // Same content, same width: the echo's rows must equal the composer's
+        // gutter and wrap, or a submitted prompt visibly moves.
+        let content = "0123456789ab";
+        let (composer_rows, _) = wrap_composer(&[content.to_string()], (0, 0), 10 - GUTTER);
+        let echo = wrap_all(&[DisplayLine::new(Tone::User, format!("> {content}"))], 10);
+        let echo_rows: Vec<String> = echo.into_iter().map(|(_, row)| row).collect();
+        let expected: Vec<String> = composer_rows
+            .iter()
+            .enumerate()
+            .map(|(number, row)| {
+                let gutter = if number == 0 { "> " } else { "  " };
+                format!("{gutter}{row}")
+            })
+            .collect();
+        assert_eq!(echo_rows, expected);
     }
 
     #[test]

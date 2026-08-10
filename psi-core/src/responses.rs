@@ -270,11 +270,20 @@ impl Decoder {
                 });
                 events
             }
-            "error" => vec![ModelEvent::Error {
-                message: string(event, "message")
-                    .unwrap_or("stream error")
-                    .to_string(),
-            }],
+            // Error events have carried their message both at the top level
+            // and nested under `error`; a shape carrying neither surfaces raw,
+            // so the cause is never reduced to a guess.
+            "error" => {
+                let message = string(event, "message")
+                    .or_else(|| {
+                        event
+                            .get("error")
+                            .and_then(|error| string(error, "message"))
+                    })
+                    .map(str::to_string)
+                    .unwrap_or_else(|| event.to_string().chars().take(300).collect());
+                vec![ModelEvent::Error { message }]
+            }
             _ => Vec::new(),
         }
     }

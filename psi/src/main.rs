@@ -16,32 +16,20 @@ use psi_core::tools::default_profile;
 use psi_core::{Harness, HarnessConfig};
 use tokio::sync::mpsc;
 
+/// The head of `--help`. The keys and commands themselves are `tui::HELP`, the
+/// same list `/help` prints, so the two can never drift.
 const USAGE: &str = "\
 usage: psi [--continue] [prompt]
        with a prompt, one turn runs headless; with none, the TUI opens.
 
 environment: OPENAI_API_KEY (required), PSI_MODEL, PSI_BASE_URL, PSI_SESSIONS_DIR
-
-keys, composing:
-  Enter          send the message
-  Ctrl-J         newline (Alt-Enter also works)
-  Esc            leave insert mode; in normal mode, cancel the running turn
-  Ctrl-C         cancel the running turn, or quit at the prompt
-  Ctrl-P/Ctrl-N  earlier and later prompts
-  Ctrl-B         branch mode
-  normal mode    i a o O x, h j k l, w b e, 0 $, dd, and counts on any of them
-
-keys, branch mode:
-  k / j          select an older or newer message on this branch
-  Enter          edit the selected message: forks when you send it
-  Tab / BackTab  switch branch
-  Esc            back to composing";
+";
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("{USAGE}");
+        println!("{USAGE}\n{}", tui::HELP.join("\n"));
         return ExitCode::SUCCESS;
     }
     let (resume, prompt) = match args.split_first() {
@@ -49,7 +37,21 @@ async fn main() -> ExitCode {
         _ => (false, args.join(" ")),
     };
 
-    let (commands, events) = match harness() {
+    let sessions_dir = match sessions_dir() {
+        Some(dir) => dir,
+        None => {
+            eprintln!("psi: set HOME or PSI_SESSIONS_DIR");
+            return ExitCode::FAILURE;
+        }
+    };
+    let workspace = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("psi: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (commands, events) = match harness(workspace.clone(), sessions_dir.clone()) {
         Ok(harness) => harness,
         Err(message) => {
             eprintln!("psi: {message}");
@@ -58,7 +60,7 @@ async fn main() -> ExitCode {
     };
 
     if prompt.is_empty() {
-        return match tui::run(commands, events, resume).await {
+        return match tui::run(commands, events, resume, workspace, sessions_dir).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("psi: {err}");
@@ -70,10 +72,10 @@ async fn main() -> ExitCode {
 }
 
 /// Builds the harness both modes talk to.
-fn harness() -> Result<(mpsc::Sender<Command>, mpsc::Receiver<Event>), String> {
-    let sessions_dir = sessions_dir().ok_or("set HOME or PSI_SESSIONS_DIR")?;
-    let workspace = std::env::current_dir().map_err(|err| err.to_string())?;
-
+fn harness(
+    workspace: PathBuf,
+    sessions_dir: PathBuf,
+) -> Result<(mpsc::Sender<Command>, mpsc::Receiver<Event>), String> {
     let mut config = OpenAiConfig::default();
     if let Ok(model) = std::env::var("PSI_MODEL") {
         config.model = model;
