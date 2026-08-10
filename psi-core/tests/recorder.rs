@@ -82,11 +82,14 @@ fn live_script() -> Vec<FakeResponse> {
 }
 
 /// A snapshot of a real workspace is not all UTF-8; `logo.bin` keeps the
-/// round trip honest about that.
+/// round trip honest about that. The `loop` symlink points back at the
+/// fixture itself: snapshotting must skip it rather than recurse into it.
 fn fixture(dir: &Path) {
     std::fs::write(dir.join("notes.txt"), "remember the limit\n").unwrap();
     std::fs::write(dir.join("config.txt"), "limit=1\n").unwrap();
     std::fs::write(dir.join("logo.bin"), [0u8, 159, 146, 150]).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir, dir.join("loop")).unwrap();
 }
 
 async fn record_live_run(root: &Path) -> std::path::PathBuf {
@@ -124,6 +127,12 @@ async fn a_recorded_run_replays_itself() {
         task.fixture
             .iter()
             .any(|(path, contents)| path == "logo.bin" && contents.as_slice() == [0, 159, 146, 150])
+    );
+    // The fixture's self-referential symlink was skipped, not followed.
+    assert!(
+        task.fixture
+            .iter()
+            .all(|(path, _)| !path.starts_with("loop"))
     );
 
     let config = BenchConfig {

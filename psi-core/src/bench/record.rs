@@ -445,14 +445,22 @@ fn matches_final_state(workspace: &Path, finals: &[(String, Vec<u8>)]) -> bool {
 }
 
 /// Every file under `root`, as workspace-relative paths, sorted for
-/// deterministic fixtures. Paths and bytes only — file modes are not carried
-/// through a replay, so a fixture whose scripts must run invokes them through
-/// an interpreter (`sh test.sh`), not an execute bit.
+/// deterministic fixtures. Paths and bytes only — file modes and empty
+/// directories are not carried through a replay, so a fixture whose scripts
+/// must run invokes them through an interpreter (`sh test.sh`), not an
+/// execute bit. Symlinks are skipped, the tools' walker rule, so the
+/// snapshot, the layout, and the final-state comparison all see the tree the
+/// tools see — and a link back to an ancestor cannot recurse the walk.
 fn read_files(root: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
     fn walk(root: &Path, dir: &Path, files: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let path = entry.path();
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
                 walk(root, &path, files)?;
             } else {
                 let relative = path
@@ -471,12 +479,19 @@ fn read_files(root: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
     Ok(files)
 }
 
+/// Copies a tree, skipping symlinks by the same rule as `read_files`:
+/// following one could recurse through an ancestor or capture data outside
+/// the fixture.
 fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            continue;
+        }
         let target = to.join(entry.file_name());
-        if entry.path().is_dir() {
+        if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else {
             std::fs::copy(entry.path(), &target)?;
